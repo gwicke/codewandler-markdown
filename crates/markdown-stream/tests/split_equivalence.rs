@@ -27,6 +27,16 @@ fn split_equivalence_on_samples() {
         "<pre>\nx\n\ny\n</pre>\nokay\n",
         // Inline raw HTML inside a paragraph.
         "a <span class=\"x\"> b </span> c\n",
+        // Nested lists: the looseness/tightness decision and the buffered list events must be
+        // identical no matter where the chunk boundary falls.
+        "- foo\n  - bar\n    - baz\n",
+        // A loose list (blank line between items) — looseness is only known once the list closes,
+        // so the buffered `EnterBlock(List{tight})` flag must still be chunk-independent.
+        "- a\n\n- b\n\n- c\n",
+        // Mixed: a loose outer item containing a tight nested list plus a trailing paragraph.
+        "* foo\n  * bar\n\n  baz\n",
+        // A list item whose content is a code block and a blockquote (multiple child blocks).
+        "1.  foo\n\n    ```\n    bar\n    ```\n\n    > quux\n",
     ];
     for s in samples {
         let whole = parse(s);
