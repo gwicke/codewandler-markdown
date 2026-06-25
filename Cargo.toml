@@ -1,0 +1,33 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/markdown-stream",
+    "crates/markdown-html",
+    "crates/markdown-terminal",
+    "crates/markdown",
+]
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/codewandler/markdown"
+homepage = "https://github.com/codewandler/markdown"
+rust-version = "1.85"
+
+[workspace.dependencies]
+# internal
+markdown-stream = { path = "crates/markdown-stream" }
+markdown-html = { path = "crates/markdown-html" }
+markdown-terminal = { path = "crates/markdown-terminal" }
+# external
+unicode-width = "0.2"
+is-terminal = "0.4"
+thiserror = "2"
+# dev / test only
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"

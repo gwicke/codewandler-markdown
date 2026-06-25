@@ -1,0 +1,11 @@
+[package]
+name = "markdown-html"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Render a markdown-stream event stream to HTML (used to measure CommonMark/GFM compliance)"
+
+[dependencies]
+markdown-stream.workspace = true

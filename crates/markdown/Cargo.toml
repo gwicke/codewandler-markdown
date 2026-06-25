@@ -1,0 +1,17 @@
+[package]
+name = "markdown"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Streaming Markdown: an incremental CommonMark/GFM parser with terminal + HTML renderers"
+
+[dependencies]
+markdown-stream.workspace = true
+markdown-html.workspace = true
+markdown-terminal.workspace = true
+
+[dev-dependencies]
+serde.workspace = true
+serde_json.workspace = true

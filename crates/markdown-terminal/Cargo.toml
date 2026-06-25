@@ -1,0 +1,13 @@
+[package]
+name = "markdown-terminal"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Render a markdown-stream event stream to styled terminal output (ANSI), with a live/streaming renderer"
+
+[dependencies]
+markdown-stream.workspace = true
+unicode-width.workspace = true
+is-terminal.workspace = true
