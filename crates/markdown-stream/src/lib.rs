@@ -10,41 +10,14 @@
 
 #![forbid(unsafe_code)]
 
+mod block;
 mod event;
+mod inline;
 mod parser;
 
-pub use event::{
-    Alignment, BlockData, BlockKind, Event, InlineStyle, Link, ListData, Span,
-};
+pub use block::StreamParser;
+pub use event::{Alignment, BlockData, BlockKind, Event, InlineStyle, Link, ListData, Span};
 pub use parser::Parser;
-
-/// The concrete streaming parser.
-///
-/// The implementation is built up across milestones (blocks → inlines → GFM); this scaffold
-/// establishes the public contract and an honest empty stream until the block parser lands.
-#[derive(Default)]
-pub struct StreamParser {}
-
-impl StreamParser {
-    /// Create a new parser with default options.
-    pub fn new() -> Self {
-        Self::default()
-    }
-}
-
-impl Parser for StreamParser {
-    fn write(&mut self, _chunk: &[u8]) -> Vec<Event> {
-        Vec::new()
-    }
-
-    fn flush(&mut self) -> Vec<Event> {
-        Vec::new()
-    }
-
-    fn reset(&mut self) {
-        *self = Self::default();
-    }
-}
 
 /// Parse a complete document to a `Vec<Event>` (convenience over the streaming API).
 pub fn parse(input: &str) -> Vec<Event> {
