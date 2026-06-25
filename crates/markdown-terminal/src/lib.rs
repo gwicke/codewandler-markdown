@@ -9,7 +9,7 @@
 
 use std::io::{self, Write};
 
-use markdown_stream::{BlockKind, Event, InlineStyle};
+use markdown_stream::{Alignment, BlockKind, Event, InlineStyle};
 use unicode_width::UnicodeWidthStr;
 
 mod theme;
@@ -44,6 +44,7 @@ pub struct Renderer {
     block: Vec<BlockKind>,
     in_code: bool,
     code_lang: String,
+    table: Option<TableBuf>,
     /// blank line owed before the next block
     pending_gap: bool,
     wrote_any: bool,
@@ -52,6 +53,13 @@ pub struct Renderer {
 struct ListCtx {
     ordered: bool,
     next: u64,
+}
+
+/// Buffers a table's rendered cells until it closes, so column widths can be computed.
+struct TableBuf {
+    aligns: Vec<Alignment>,
+    rows: Vec<Vec<String>>,
+    cur_row: Vec<String>,
 }
 
 impl Renderer {
@@ -66,6 +74,7 @@ impl Renderer {
             block: Vec::new(),
             in_code: false,
             code_lang: String::new(),
+            table: None,
             pending_gap: false,
             wrote_any: false,
         }
@@ -131,6 +140,20 @@ impl Renderer {
                         self.code_lang =
                             data.info.split_whitespace().next().unwrap_or("").to_string();
                     }
+                    BlockKind::Table => {
+                        self.gap(w)?;
+                        self.table = Some(TableBuf {
+                            aligns: data.alignment.clone(),
+                            rows: Vec::new(),
+                            cur_row: Vec::new(),
+                        });
+                    }
+                    BlockKind::TableRow => {
+                        if let Some(t) = &mut self.table {
+                            t.cur_row.clear();
+                        }
+                    }
+                    BlockKind::TableCell => self.segments.clear(),
                     _ => {}
                 }
                 self.block.push(*block);
@@ -173,6 +196,19 @@ impl Renderer {
                         self.in_code = false;
                         self.pending_gap = true;
                     }
+                    BlockKind::TableCell => {
+                        let s = self.inline_string();
+                        if let Some(t) = &mut self.table {
+                            t.cur_row.push(s);
+                        }
+                    }
+                    BlockKind::TableRow => {
+                        if let Some(t) = &mut self.table {
+                            let row = std::mem::take(&mut t.cur_row);
+                            t.rows.push(row);
+                        }
+                    }
+                    BlockKind::Table => self.render_table(w)?,
                     _ => {}
                 }
             }
@@ -216,6 +252,66 @@ impl Renderer {
             }
         }
         self.wrote_any = true;
+        Ok(())
+    }
+
+    /// Render the current inline segments to a single styled line (used for a table cell).
+    fn inline_string(&mut self) -> String {
+        let segs = std::mem::take(&mut self.segments);
+        let mut s = String::new();
+        for (text, style) in &segs {
+            let t = text.replace('\n', " ");
+            s.push_str(&self.styled(&t, style, None));
+        }
+        s
+    }
+
+    /// Render a buffered table: compute column widths, draw box-drawing borders, align cells.
+    fn render_table<W: Write>(&mut self, w: &mut W) -> io::Result<()> {
+        let Some(t) = self.table.take() else {
+            return Ok(());
+        };
+        self.gap(w)?;
+        let ncol = t
+            .aligns
+            .len()
+            .max(t.rows.iter().map(Vec::len).max().unwrap_or(0));
+        let mut widths = vec![0usize; ncol];
+        for row in &t.rows {
+            for (i, cell) in row.iter().enumerate() {
+                widths[i] = widths[i].max(visible_width(cell));
+            }
+        }
+        let indent = self.indent();
+        let m = self.theme.muted;
+        let r = self.theme.reset;
+        for (ri, row) in t.rows.iter().enumerate() {
+            write!(w, "{indent}{m}│{r} ")?;
+            for (i, width) in widths.iter().enumerate() {
+                let cell = row.get(i).map(String::as_str).unwrap_or("");
+                let pad = width.saturating_sub(visible_width(cell));
+                match t.aligns.get(i).copied().unwrap_or(Alignment::None) {
+                    Alignment::Right => write!(w, "{}{cell}", " ".repeat(pad))?,
+                    Alignment::Center => {
+                        let l = pad / 2;
+                        write!(w, "{}{cell}{}", " ".repeat(l), " ".repeat(pad - l))?;
+                    }
+                    _ => write!(w, "{cell}{}", " ".repeat(pad))?,
+                }
+                write!(w, " {m}│{r} ")?;
+            }
+            writeln!(w)?;
+            if ri == 0 {
+                write!(w, "{indent}{m}├")?;
+                for (i, width) in widths.iter().enumerate() {
+                    write!(w, "{}", "─".repeat(width + 2))?;
+                    write!(w, "{}", if i + 1 < ncol { "┼" } else { "┤" })?;
+                }
+                writeln!(w, "{r}")?;
+            }
+        }
+        self.wrote_any = true;
+        self.pending_gap = true;
         Ok(())
     }
 

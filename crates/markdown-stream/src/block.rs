@@ -34,6 +34,9 @@ enum Leaf {
         ch: u8,
         len: usize,
     },
+    Table {
+        aligns: Vec<Alignment>,
+    },
 }
 
 impl StreamParser {
@@ -117,6 +120,17 @@ impl StreamParser {
             return;
         }
 
+        // Inside a GFM table: a pipe row is a body row; anything else closes the table and is then
+        // handled normally.
+        if let Leaf::Table { aligns } = &self.leaf {
+            if !content.trim().is_empty() && content.contains('|') {
+                let aligns = aligns.clone();
+                self.emit_row(split_row(&content), &aligns, out);
+                return;
+            }
+            self.close_leaf(out);
+        }
+
         // Blank line: closes a paragraph; ends a lazy blockquote.
         if content.trim().is_empty() {
             self.close_leaf(out);
@@ -192,6 +206,18 @@ impl StreamParser {
         // Default: paragraph text (new or lazy continuation).
         match &mut self.leaf {
             Leaf::Paragraph(p) => {
+                // A single-line paragraph containing `|` followed by a delimiter row starts a table.
+                if !p.contains('\n') && p.contains('|') {
+                    if let Some(aligns) = parse_delim_row(trimmed) {
+                        let headers = split_row(p);
+                        if headers.len() == aligns.len() {
+                            let header = std::mem::take(p);
+                            self.leaf = Leaf::None;
+                            self.start_table(&header, aligns, out);
+                            return;
+                        }
+                    }
+                }
                 p.push('\n');
                 p.push_str(content.trim_end());
             }
@@ -260,7 +286,35 @@ impl StreamParser {
             Leaf::Fenced { .. } => {
                 out.push(Event::exit(BlockKind::FencedCode));
             }
+            Leaf::Table { .. } => {
+                out.push(Event::exit(BlockKind::Table));
+            }
         }
+    }
+
+    fn start_table(&mut self, header: &str, aligns: Vec<Alignment>, out: &mut Vec<Event>) {
+        let data = BlockData {
+            alignment: aligns.clone(),
+            ..Default::default()
+        };
+        out.push(Event::EnterBlock {
+            block: BlockKind::Table,
+            data,
+            span: Span::default(),
+        });
+        self.emit_row(split_row(header), &aligns, out);
+        self.leaf = Leaf::Table { aligns };
+    }
+
+    fn emit_row(&mut self, mut cells: Vec<String>, aligns: &[Alignment], out: &mut Vec<Event>) {
+        cells.resize(aligns.len(), String::new()); // pad short rows / drop extra cells (GFM)
+        out.push(Event::enter(BlockKind::TableRow));
+        for cell in cells {
+            out.push(Event::enter(BlockKind::TableCell));
+            inline::parse(cell.trim(), &InlineStyle::default(), out);
+            out.push(Event::exit(BlockKind::TableCell));
+        }
+        out.push(Event::exit(BlockKind::TableRow));
     }
 
     fn close_list(&mut self, out: &mut Vec<Event>) {
@@ -361,4 +415,67 @@ fn list_marker(line: &str) -> Option<(bool, char, u64, &str)> {
         }
     }
     None
+}
+
+/// Split a GFM table row into trimmed cell strings, honoring escaped pipes and the optional
+/// leading/trailing `|`.
+fn split_row(line: &str) -> Vec<String> {
+    let mut s = line.trim();
+    s = s.strip_prefix('|').unwrap_or(s);
+    s = s.strip_suffix('|').unwrap_or(s);
+    let mut cells = Vec::new();
+    let mut cur = String::new();
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => {
+                if let Some(&n) = chars.peek() {
+                    cur.push('\\');
+                    cur.push(n);
+                    chars.next();
+                } else {
+                    cur.push('\\');
+                }
+            }
+            '|' => {
+                cells.push(cur.trim().to_string());
+                cur.clear();
+            }
+            _ => cur.push(c),
+        }
+    }
+    cells.push(cur.trim().to_string());
+    cells
+}
+
+/// Parse a table delimiter row (e.g. `| :--- | :--: | ---: |`) into per-column alignments. Returns
+/// `None` if the line isn't a valid delimiter row.
+fn parse_delim_row(line: &str) -> Option<Vec<Alignment>> {
+    if !line.contains('|') && !line.contains('-') {
+        return None;
+    }
+    let cells = split_row(line);
+    if cells.is_empty() {
+        return None;
+    }
+    let mut aligns = Vec::with_capacity(cells.len());
+    for cell in &cells {
+        let c = cell.trim();
+        if c.is_empty() {
+            return None;
+        }
+        let left = c.starts_with(':');
+        let right = c.ends_with(':');
+        let mid = &c[usize::from(left)..c.len() - usize::from(right)];
+        if mid.is_empty() || !mid.bytes().all(|b| b == b'-') {
+            return None;
+        }
+        aligns.push(match (left, right) {
+            (true, true) => Alignment::Center,
+            (true, false) => Alignment::Left,
+            (false, true) => Alignment::Right,
+            (false, false) => Alignment::None,
+        });
+    }
+    Some(aligns)
 }
