@@ -28,9 +28,30 @@ type Refs = HashMap<String, LinkDef>;
 /// given base `style`, resolving reference links against `refs`, appending events to `out`. `gfm`
 /// enables the GFM extended (bare) autolink syntax.
 pub fn parse(text: &str, style: &InlineStyle, refs: &Refs, gfm: bool, out: &mut Vec<Event>) {
-    let mut tokens = scan(text, refs, gfm);
+    let mut tokens = scan(text, refs, gfm, &mut None);
     process_emphasis(&mut tokens, 0);
     flatten(&tokens, style, out);
+}
+
+/// Like [`parse`], but also reports the normalised labels of any reference link/image whose label is
+/// **not yet defined** in `refs`. The block parser uses this to detect *forward references* — a
+/// `[label]`-shaped construct that would resolve if `label` were defined later in the document — so
+/// it can hold the block and re-parse it once all definitions are known. The collected labels are
+/// exactly those that, were they to appear in `refs`, would change the output, so the block parser
+/// can release a held block the moment none of its labels remain undefinable.
+pub fn parse_collect_unresolved(
+    text: &str,
+    style: &InlineStyle,
+    refs: &Refs,
+    gfm: bool,
+    out: &mut Vec<Event>,
+    unresolved: &mut Vec<String>,
+) {
+    let mut sink = Some(std::mem::take(unresolved));
+    let mut tokens = scan(text, refs, gfm, &mut sink);
+    process_emphasis(&mut tokens, 0);
+    flatten(&tokens, style, out);
+    *unresolved = sink.unwrap_or_default();
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -95,8 +116,9 @@ struct Delim {
 
 /// Scan `text` left to right into a flat token list, resolving every non-emphasis construct.
 /// `refs` resolves reference links/images encountered along the way; `gfm` enables the extended
-/// (bare) autolink syntax.
-fn scan(text: &str, refs: &Refs, gfm: bool) -> Vec<Token> {
+/// (bare) autolink syntax. When `unresolved` is `Some`, the normalised labels of reference
+/// links/images whose label is undefined are recorded into it (for forward-reference detection).
+fn scan(text: &str, refs: &Refs, gfm: bool, unresolved: &mut Option<Vec<String>>) -> Vec<Token> {
     let b = text.as_bytes();
     let mut tokens: Vec<Token> = Vec::new();
     let mut buf = String::new();
@@ -172,7 +194,7 @@ fn scan(text: &str, refs: &Refs, gfm: bool) -> Vec<Token> {
             }
             // Image `![alt](dest)` / `![alt][ref]` / `![ref]`.
             b'!' if i + 1 < b.len() && b[i + 1] == b'[' => {
-                if let Some((tok, consumed)) = try_link(text, i + 1, true, refs, gfm) {
+                if let Some((tok, consumed)) = try_link(text, i + 1, true, refs, gfm, unresolved) {
                     flush!();
                     tokens.push(tok);
                     i += 1 + consumed;
@@ -183,7 +205,7 @@ fn scan(text: &str, refs: &Refs, gfm: bool) -> Vec<Token> {
             }
             // Link `[text](dest)` / `[text][ref]` / `[ref]`.
             b'[' => {
-                if let Some((tok, consumed)) = try_link(text, i, false, refs, gfm) {
+                if let Some((tok, consumed)) = try_link(text, i, false, refs, gfm, unresolved) {
                     flush!();
                     tokens.push(tok);
                     i += consumed;
@@ -659,6 +681,7 @@ fn try_link(
     image: bool,
     refs: &Refs,
     gfm: bool,
+    unresolved: &mut Option<Vec<String>>,
 ) -> Option<(Token, usize)> {
     let b = text.as_bytes();
     let close = matching_bracket(b, open)?;
@@ -667,7 +690,7 @@ fn try_link(
     // Scan the bracketed content once; reused as the link/image inner tokens. A *link* (not an
     // image) may not contain another link — the inner link binds tighter — so if it does we reject
     // the outer link and let scanning fall through to the literal `[` and re-match the inner link.
-    let inner = scan_inner(label_raw, refs, gfm);
+    let inner = scan_inner(label_raw, refs, gfm, unresolved);
     let nested_link = contains_link(&inner);
     let make = |link: Link, end: usize| {
         if !image && nested_link {
@@ -699,8 +722,11 @@ fn try_link(
                 if let Some(link) = resolve_ref(label_raw, image, refs) {
                     return make(link, ref_close + 1);
                 }
+                note_unresolved(label_raw, unresolved);
             } else if let Some(link) = resolve_ref(ref_label, image, refs) {
                 return make(link, ref_close + 1);
+            } else {
+                note_unresolved(ref_label, unresolved);
             }
             // A full/collapsed reference whose label is undefined is not a link.
             return None;
@@ -712,13 +738,31 @@ fn try_link(
     if let Some(link) = resolve_ref(label_raw, image, refs) {
         return make(link, close + 1);
     }
+    // An undefined shortcut reference would resolve if its label were defined later, so record it.
+    note_unresolved(label_raw, unresolved);
 
     None
 }
 
+/// Record a reference label that did not resolve (its normalised form), so the block parser can
+/// detect that the enclosing block holds a forward reference. A label that cannot normalise (empty /
+/// whitespace-only) can never resolve, so it is ignored.
+fn note_unresolved(label: &str, unresolved: &mut Option<Vec<String>>) {
+    if let Some(sink) = unresolved {
+        if let Some(norm) = linkref::normalize_label(label) {
+            sink.push(norm);
+        }
+    }
+}
+
 /// Parse and scan a link/image label's inner content (emphasis resolved).
-fn scan_inner(label: &str, refs: &Refs, gfm: bool) -> Vec<Token> {
-    let mut inner = scan(label, refs, gfm);
+fn scan_inner(
+    label: &str,
+    refs: &Refs,
+    gfm: bool,
+    unresolved: &mut Option<Vec<String>>,
+) -> Vec<Token> {
+    let mut inner = scan(label, refs, gfm, unresolved);
     process_emphasis(&mut inner, 0);
     inner
 }

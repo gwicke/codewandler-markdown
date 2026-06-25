@@ -44,6 +44,39 @@ pub struct StreamParser {
     /// autolinks and task-list-item markers. (Strikethrough and tables are always on.) The flag is
     /// off by default so the plain [`StreamParser::new`] path stays CommonMark-faithful.
     gfm: bool,
+    /// The forward-reference output gate. Finalised top-level output is staged here as [`Slot`]s
+    /// (resolved events plus deferred inline runs) so a block holding an as-yet-undefined reference —
+    /// and every event after it — can be held until the reference resolves or `flush()` is reached,
+    /// while a document with no forward references streams out eagerly. See [`Self::drain_gate`].
+    gate: Vec<Slot>,
+}
+
+/// A staged unit of top-level output. Most output is a finalised [`Event`]; a block whose inline
+/// content references an as-yet-undefined label is staged as a [`Slot::Deferred`] run to be
+/// re-parsed once all link reference definitions are known.
+enum Slot {
+    /// A finalised event, replayed verbatim on release.
+    Event(Event),
+    /// A run of inline content holding one or more **forward references**: re-parsed against the
+    /// complete `refs` map at release time (so a later `[label]: /url` resolves it).
+    Deferred(Deferred),
+}
+
+/// A held inline run carrying at least one forward reference. `text` is the raw (refdef-stripped,
+/// trailing-trimmed) inline source; `style` the base style; `labels` the normalised labels that were
+/// undefined when the run was first parsed — once every one of them is either defined or known to be
+/// undefinable (only at `flush`), the run can be re-parsed and released.
+struct Deferred {
+    text: String,
+    style: InlineStyle,
+    labels: Vec<String>,
+}
+
+/// A list item's paragraph run when assembled at list close: either fully resolved events or a
+/// deferred (forward-reference-carrying) run to re-parse at gate release.
+enum ParaRun {
+    Resolved(Vec<Event>),
+    Deferred(Deferred),
 }
 
 /// One open container in the stack.
@@ -88,6 +121,16 @@ enum BufEvent {
     /// A run of paragraph inline content (the text events between `<p>`…`</p>`), buffered so that in
     /// a tight list the wrapper is dropped and in a loose list it is kept.
     Para(Vec<Event>),
+    /// A deferred inline run (a list-item paragraph carrying a forward reference), with the same
+    /// looseness-dependent `<p>` wrapping as [`BufEvent::Para`] but re-parsed at gate-release time.
+    /// `prefix` holds any already-materialised leading events (e.g. a GFM task-list checkbox).
+    DeferPara {
+        prefix: Vec<Event>,
+        deferred: Deferred,
+    },
+    /// A deferred inline run propagated *as-is* from a nested list whose looseness wrapping was
+    /// already applied: replayed verbatim (like [`BufEvent::Raw`]) without re-wrapping.
+    DeferRaw(Deferred),
 }
 
 #[derive(Default)]
@@ -181,8 +224,13 @@ impl Parser for StreamParser {
         self.close_leaf(&mut out);
         self.close_containers_to(0, &mut out);
         if self.started {
-            out.push(Event::exit(BlockKind::Document));
+            // Stage the document close behind any still-held content, then force a final drain: all
+            // link reference definitions are now known, so every remaining deferred run resolves
+            // (or, if still undefined, falls back to literal text).
+            self.gate
+                .push(Slot::Event(Event::exit(BlockKind::Document)));
         }
+        self.flush_gate(&mut out);
         self.flushed = true;
         out
     }
@@ -773,13 +821,14 @@ impl StreamParser {
 
     // --- list buffering helpers ---------------------------------------------------------------
 
-    /// Emit an event, routing it into the innermost open list's buffer if one is open, else straight
-    /// to `out`.
+    /// Emit an event, routing it into the innermost open list's buffer if one is open, else staging
+    /// it on the forward-reference gate. `out` is drained from the gate once per write/flush.
     fn emit(&mut self, out: &mut Vec<Event>, ev: Event) {
         if let Some(frame) = self.innermost_list_mut() {
             frame.events.push(BufEvent::Raw(ev));
         } else {
-            out.push(ev);
+            self.gate.push(Slot::Event(ev));
+            self.drain_gate(out);
         }
     }
 
@@ -790,9 +839,91 @@ impl StreamParser {
             frame.events.push(BufEvent::Para(para));
         } else {
             // Not in a list: paragraphs are always wrapped.
-            out.push(Event::enter(BlockKind::Paragraph));
-            out.extend(para);
-            out.push(Event::exit(BlockKind::Paragraph));
+            self.gate
+                .push(Slot::Event(Event::enter(BlockKind::Paragraph)));
+            for ev in para {
+                self.gate.push(Slot::Event(ev));
+            }
+            self.gate
+                .push(Slot::Event(Event::exit(BlockKind::Paragraph)));
+            self.drain_gate(out);
+        }
+    }
+
+    /// Buffer a deferred list-item paragraph run (a direct child of a list item) so its `<p>` wrapper
+    /// can be toggled by looseness at list close, like [`BufEvent::Para`]. Only called while a list
+    /// is open.
+    fn emit_buf_para_defer(&mut self, prefix: Vec<Event>, deferred: Deferred) {
+        if let Some(frame) = self.innermost_list_mut() {
+            frame.events.push(BufEvent::DeferPara { prefix, deferred });
+        }
+    }
+
+    /// Buffer a deferred inline run that is already positioned between explicit `<p>` events (a
+    /// paragraph nested under another block inside a list item): replayed verbatim, no re-wrapping.
+    /// Only called while a list is open.
+    fn emit_buf_raw_defer(&mut self, deferred: Deferred) {
+        if let Some(frame) = self.innermost_list_mut() {
+            frame.events.push(BufEvent::DeferRaw(deferred));
+        }
+    }
+
+    /// Stage a deferred paragraph inline run (one carrying a forward reference) at the top level: a
+    /// `<p>` wrapper around an optional already-materialised `prefix` and the deferred run.
+    fn emit_defer_para(&mut self, out: &mut Vec<Event>, prefix: Vec<Event>, deferred: Deferred) {
+        self.gate
+            .push(Slot::Event(Event::enter(BlockKind::Paragraph)));
+        for ev in prefix {
+            self.gate.push(Slot::Event(ev));
+        }
+        self.gate.push(Slot::Deferred(deferred));
+        self.gate
+            .push(Slot::Event(Event::exit(BlockKind::Paragraph)));
+        self.drain_gate(out);
+    }
+
+    // --- forward-reference output gate --------------------------------------------------------
+
+    /// Release as many staged [`Slot`]s as is safe, preserving document order. Leading `Slot::Event`s
+    /// flow out freely; a `Slot::Deferred` flows out only once **every** label it awaits is defined
+    /// (re-parsed against the now-complete-enough `refs`). The walk stops at the first deferred slot
+    /// still awaiting a definition — holding it, and everything after it, until the definition lands
+    /// or `flush()` forces a final drain. This bounds buffering to the span from the first unresolved
+    /// reference to its resolving definition (or EOF), and emits nothing out of order.
+    fn drain_gate(&mut self, out: &mut Vec<Event>) {
+        let mut release = 0;
+        for slot in &self.gate {
+            match slot {
+                Slot::Event(_) => release += 1,
+                Slot::Deferred(d) => {
+                    if d.labels.iter().all(|l| self.refs.contains_key(l)) {
+                        release += 1;
+                    } else {
+                        break;
+                    }
+                }
+            }
+        }
+        let released: Vec<Slot> = self.gate.drain(..release).collect();
+        self.emit_slots(released, out);
+    }
+
+    /// Force-release every staged slot at end of input: all link reference definitions are now known,
+    /// so any deferred run whose labels are still undefined re-parses to literal text (CommonMark).
+    fn flush_gate(&mut self, out: &mut Vec<Event>) {
+        let slots: Vec<Slot> = std::mem::take(&mut self.gate);
+        self.emit_slots(slots, out);
+    }
+
+    /// Materialise a run of released slots into `out`, re-parsing deferred runs against `self.refs`.
+    fn emit_slots(&self, slots: Vec<Slot>, out: &mut Vec<Event>) {
+        for slot in slots {
+            match slot {
+                Slot::Event(ev) => out.push(ev),
+                Slot::Deferred(d) => {
+                    inline::parse(&d.text, &d.style, &self.refs, self.gfm, out);
+                }
+            }
         }
     }
 
@@ -918,9 +1049,27 @@ impl StreamParser {
         // newline rules: a `\n` precedes every top-level *block* child of the item, and a `\n`
         // precedes `</li>` iff the item's last child is a block. Inline children (tight, unwrapped
         // paragraph text) get no separators, so a tight inline-only item stays `<li>x</li>`.
-        let mut body: Vec<Event> = Vec::new();
-        let mut item: Vec<Event> = Vec::new();
+        let mut body: Vec<Slot> = Vec::new();
+        let mut item: Vec<Slot> = Vec::new();
         let mut in_item = false;
+
+        // Push a paragraph run (resolved events or a deferred run) into `target`, wrapping it in
+        // `<p>` only when the list is loose. `prefix` holds any already-materialised leading events.
+        let push_para = |target: &mut Vec<Slot>, prefix: Vec<Event>, run: ParaRun| {
+            if !tight {
+                target.push(Slot::Event(Event::enter(BlockKind::Paragraph)));
+            }
+            for ev in prefix {
+                target.push(Slot::Event(ev));
+            }
+            match run {
+                ParaRun::Resolved(inner) => target.extend(inner.into_iter().map(Slot::Event)),
+                ParaRun::Deferred(d) => target.push(Slot::Deferred(d)),
+            }
+            if !tight {
+                target.push(Slot::Event(Event::exit(BlockKind::Paragraph)));
+            }
+        };
 
         for be in frame.events {
             match be {
@@ -935,45 +1084,49 @@ impl StreamParser {
                 }
                 BufEvent::Para(inner) => {
                     let target = if in_item { &mut item } else { &mut body };
-                    if tight {
-                        target.extend(inner);
-                    } else {
-                        target.push(Event::enter(BlockKind::Paragraph));
-                        target.extend(inner);
-                        target.push(Event::exit(BlockKind::Paragraph));
-                    }
+                    push_para(target, Vec::new(), ParaRun::Resolved(inner));
+                }
+                BufEvent::DeferPara { prefix, deferred } => {
+                    let target = if in_item { &mut item } else { &mut body };
+                    push_para(target, prefix, ParaRun::Deferred(deferred));
+                }
+                BufEvent::DeferRaw(deferred) => {
+                    let target = if in_item { &mut item } else { &mut body };
+                    target.push(Slot::Deferred(deferred));
                 }
                 BufEvent::Raw(ev) => {
-                    if in_item {
-                        item.push(ev);
-                    } else {
-                        body.push(ev);
-                    }
+                    let target = if in_item { &mut item } else { &mut body };
+                    target.push(Slot::Event(ev));
                 }
             }
         }
 
-        // Route the assembled list either to the enclosing list buffer or straight to output.
+        // Route the assembled list either to the enclosing list buffer or straight to the gate.
         if let Some(parent) = self.innermost_list_mut() {
             parent.events.push(BufEvent::Raw(Event::EnterBlock {
                 block: BlockKind::List,
                 data,
                 span: Span::default(),
             }));
-            for ev in body {
-                parent.events.push(BufEvent::Raw(ev));
+            for slot in body {
+                match slot {
+                    Slot::Event(ev) => parent.events.push(BufEvent::Raw(ev)),
+                    // Already positioned by this list's looseness: propagate as-is (no re-wrapping).
+                    Slot::Deferred(deferred) => parent.events.push(BufEvent::DeferRaw(deferred)),
+                }
             }
             parent
                 .events
                 .push(BufEvent::Raw(Event::exit(BlockKind::List)));
         } else {
-            out.push(Event::EnterBlock {
+            self.gate.push(Slot::Event(Event::EnterBlock {
                 block: BlockKind::List,
                 data,
                 span: Span::default(),
-            });
-            out.extend(body);
-            out.push(Event::exit(BlockKind::List));
+            }));
+            self.gate.extend(body);
+            self.gate.push(Slot::Event(Event::exit(BlockKind::List)));
+            self.drain_gate(out);
         }
     }
 
@@ -992,12 +1145,13 @@ impl StreamParser {
                 }
                 // GFM task-list item: a list item whose first block is a paragraph beginning with
                 // `[ ]`, `[x]`, or `[X]` (followed by whitespace) renders a checkbox in place of the
-                // marker. Detect it only at the item's first content.
-                let mut inner = Vec::new();
+                // marker. Detect it only at the item's first content. The checkbox is a pre-built
+                // event that precedes the (possibly deferred) inline content.
+                let mut prefix = Vec::new();
                 let mut body = body;
                 if self.gfm && self.para_is_direct_list_child() && self.item_is_empty() {
                     if let Some((checked, rest)) = task_marker(body) {
-                        inner.push(Event::Text {
+                        prefix.push(Event::Text {
                             text: format!(
                                 "<input {}disabled=\"\" type=\"checkbox\"> ",
                                 if checked { "checked=\"\" " } else { "" }
@@ -1011,29 +1165,63 @@ impl StreamParser {
                         body = rest;
                     }
                 }
-                inline::parse(
+                // Parse the inline content, collecting any forward references (labels not yet
+                // defined). When some surface, hold this paragraph's content as a deferred run so it
+                // re-parses once the definitions are known; otherwise emit it eagerly as before.
+                let style = InlineStyle::default();
+                let mut inner = Vec::new();
+                let mut labels = Vec::new();
+                inline::parse_collect_unresolved(
                     body,
-                    &InlineStyle::default(),
+                    &style,
                     &self.refs,
                     self.gfm,
                     &mut inner,
+                    &mut labels,
                 );
+                let deferred = (!labels.is_empty()).then(|| Deferred {
+                    text: body.to_string(),
+                    style,
+                    labels,
+                });
+
                 if self.para_is_direct_list_child() {
-                    // A direct child of a list item: buffer as a `Para` run so the list's looseness
-                    // can decide on the `<p>` wrapper later (tight → no wrapper).
-                    self.emit_para(out, inner);
+                    // A direct child of a list item: buffer so the list's looseness can decide on the
+                    // `<p>` wrapper later (tight → no wrapper).
+                    match deferred {
+                        Some(deferred) => self.emit_buf_para_defer(prefix, deferred),
+                        None => {
+                            let mut run = prefix;
+                            run.extend(inner);
+                            self.emit_para(out, run);
+                        }
+                    }
                 } else if self.in_any_list() {
                     // Inside a list but nested under another block (e.g. a blockquote in the item):
                     // always wrapped, but routed through the list buffer to preserve order.
                     self.emit(out, Event::enter(BlockKind::Paragraph));
-                    for ev in inner {
+                    for ev in prefix {
                         self.emit(out, ev);
+                    }
+                    match deferred {
+                        Some(deferred) => self.emit_buf_raw_defer(deferred),
+                        None => {
+                            for ev in inner {
+                                self.emit(out, ev);
+                            }
+                        }
                     }
                     self.emit(out, Event::exit(BlockKind::Paragraph));
                 } else {
-                    out.push(Event::enter(BlockKind::Paragraph));
-                    out.extend(inner);
-                    out.push(Event::exit(BlockKind::Paragraph));
+                    // Top level: stage on the gate (held iff deferred).
+                    match deferred {
+                        Some(deferred) => self.emit_defer_para(out, prefix, deferred),
+                        None => {
+                            let mut run = prefix;
+                            run.extend(inner);
+                            self.emit_para(out, run);
+                        }
+                    }
                 }
             }
             Leaf::Indented(mut lines) => {
@@ -1062,22 +1250,48 @@ impl StreamParser {
         }
     }
 
-    /// Parse inline content directly to `out` *or* the innermost list buffer.
+    /// Parse inline content (a heading or table cell, already positioned between its block's
+    /// enter/exit events) into the innermost list buffer or onto the gate. A forward reference holds
+    /// the run as a deferred unit so the surrounding block emits in order but the inline content is
+    /// re-parsed once the definition is known.
     fn parse_inline(&mut self, text: &str, out: &mut Vec<Event>) {
+        let style = InlineStyle::default();
+        let mut inner = Vec::new();
+        let mut labels = Vec::new();
+        inline::parse_collect_unresolved(
+            text,
+            &style,
+            &self.refs,
+            self.gfm,
+            &mut inner,
+            &mut labels,
+        );
+        let deferred = (!labels.is_empty()).then(|| Deferred {
+            text: text.to_string(),
+            style,
+            labels,
+        });
         if self.in_any_list() {
-            let mut inner = Vec::new();
-            inline::parse(
-                text,
-                &InlineStyle::default(),
-                &self.refs,
-                self.gfm,
-                &mut inner,
-            );
-            for ev in inner {
-                self.emit(out, ev);
+            match deferred {
+                Some(deferred) => self.emit_buf_raw_defer(deferred),
+                None => {
+                    for ev in inner {
+                        self.emit(out, ev);
+                    }
+                }
             }
         } else {
-            inline::parse(text, &InlineStyle::default(), &self.refs, self.gfm, out);
+            match deferred {
+                Some(deferred) => {
+                    self.gate.push(Slot::Deferred(deferred));
+                    self.drain_gate(out);
+                }
+                None => {
+                    for ev in inner {
+                        self.emit(out, ev);
+                    }
+                }
+            }
         }
     }
 
@@ -1396,19 +1610,19 @@ fn is_block_enter(ev: &Event) -> bool {
 /// separator between two consecutive blocks would double it; the separator is only needed after the
 /// `<li>` itself (leading block child) or after an inline run (`<li>a\n<ul>…`). Inline content (tight,
 /// unwrapped paragraph text) needs no separators — a tight inline-only item stays `<li>text</li>`.
-fn wrap_item_children(events: Vec<Event>) -> Vec<Event> {
-    let mut out = Vec::with_capacity(events.len() + 2);
+fn wrap_item_children(slots: Vec<Slot>) -> Vec<Slot> {
+    let mut out = Vec::with_capacity(slots.len() + 2);
     let mut depth = 0i32;
     // `prev_block`: was the most recent top-level child a block? Starts `false` so a leading block
     // child gets its `\n` (the `<li>\n…` layout).
     let mut prev_block = false;
-    for ev in events {
-        match &ev {
-            Event::EnterBlock { .. } => {
+    for slot in slots {
+        match &slot {
+            Slot::Event(Event::EnterBlock { .. }) => {
                 if depth == 0 {
-                    if is_block_enter(&ev) {
+                    if matches!(&slot, Slot::Event(ev) if is_block_enter(ev)) {
                         if !prev_block {
-                            out.push(Event::text("\n"));
+                            out.push(Slot::Event(Event::text("\n")));
                         }
                         prev_block = true;
                     } else {
@@ -1416,17 +1630,18 @@ fn wrap_item_children(events: Vec<Event>) -> Vec<Event> {
                     }
                 }
                 depth += 1;
-                out.push(ev);
+                out.push(slot);
             }
-            Event::ExitBlock { .. } => {
+            Slot::Event(Event::ExitBlock { .. }) => {
                 depth -= 1;
-                out.push(ev);
+                out.push(slot);
             }
+            // A deferred inline run, like any inline content, sits at depth 0 as a non-block child.
             _ => {
                 if depth == 0 {
                     prev_block = false;
                 }
-                out.push(ev);
+                out.push(slot);
             }
         }
     }

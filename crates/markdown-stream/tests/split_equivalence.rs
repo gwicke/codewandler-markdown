@@ -51,6 +51,15 @@ fn split_equivalence_on_samples() {
         "&copy; &amp; &#42;foo&#42; &#x41; &nbsp;end\n",
         // Hard line break (two trailing spaces) — trailing-space accumulation must be chunk-safe.
         "foo  \nbar\n",
+        // Forward reference: `[foo]` is used in a paragraph that closes *before* its definition. The
+        // parser must hold the paragraph (and everything after) until the def lands, re-resolving it
+        // at flush — and the held/released event stream must be identical no matter where the chunk
+        // boundary falls (including inside the held span and across the resolving definition line).
+        "[foo] and [bar]\n\nmiddle para\n\n[foo]: /a\n[bar]: /b\n",
+        // A forward reference whose label is *never* defined stays literal — still chunk-independent.
+        "see [missing] here\n\nplain tail\n",
+        // Forward reference inside a (loose) list item: the deferred run must survive list buffering.
+        "- [foo]\n\n- bar\n\n[foo]: /url\n",
     ];
     for s in samples {
         let whole = parse(s);
@@ -73,6 +82,8 @@ fn split_equivalence_gfm_samples() {
         "- [ ] todo\n- [x] done\n  - [ ] sub\n",
         // A checkbox marker that is *not* the first content (so it stays literal).
         "- text\n\n  [ ] not a task\n",
+        // Forward reference under the GFM path: held and re-resolved at flush, chunk-independently.
+        "[foo] then www.example.com\n\nmid\n\n[foo]: /url\n",
     ];
     for s in samples {
         let whole = parse_gfm(s);
