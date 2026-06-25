@@ -13,6 +13,11 @@ pub struct Theme {
     pub italic: &'static str,
     pub strike: &'static str,
     pub reset: &'static str,
+    // syntax-highlighting roles for fenced code
+    pub kw: &'static str,
+    pub str: &'static str,
+    pub comment: &'static str,
+    pub num: &'static str,
 }
 
 impl Default for Theme {
@@ -27,6 +32,10 @@ impl Default for Theme {
             italic: "\x1b[3m",
             strike: "\x1b[9m",
             reset: "\x1b[0m",
+            kw: "\x1b[35m",        // magenta
+            str: "\x1b[32m",       // green
+            comment: "\x1b[90m",   // bright black
+            num: "\x1b[33m",       // yellow
         }
     }
 }
@@ -43,6 +52,10 @@ impl Theme {
             italic: "",
             strike: "",
             reset: "",
+            kw: "",
+            str: "",
+            comment: "",
+            num: "",
         }
     }
 

@@ -12,6 +12,7 @@ use std::io::{self, Write};
 use markdown_stream::{Alignment, BlockKind, Event, InlineStyle};
 use unicode_width::UnicodeWidthStr;
 
+mod highlight;
 mod theme;
 pub use theme::Theme;
 
@@ -239,14 +240,13 @@ impl Renderer {
         for line in text.split_inclusive('\n') {
             let nl = line.ends_with('\n');
             let body = line.strip_suffix('\n').unwrap_or(line);
-            write!(
-                w,
-                "{}{}  {}{}",
-                self.indent(),
-                self.theme.code,
-                body,
-                self.theme.reset
-            )?;
+            let rendered = if self.code_lang.is_empty() {
+                // No language → uniform code color rather than guessing tokens.
+                format!("{}{}{}", self.theme.code, body, self.theme.reset)
+            } else {
+                highlight::highlight_line(body, &self.code_lang, &self.theme)
+            };
+            write!(w, "{}  {}", self.indent(), rendered)?;
             if nl {
                 writeln!(w)?;
             }
