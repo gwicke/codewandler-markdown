@@ -6,7 +6,7 @@
 
 #![forbid(unsafe_code)]
 
-use markdown_stream::{BlockKind, Event, InlineStyle, Link};
+use markdown_stream::{BlockKind, Event, Inline, Link};
 
 /// Render a sequence of events to an HTML string.
 pub fn render(events: &[Event]) -> String {
@@ -16,11 +16,55 @@ pub fn render(events: &[Event]) -> String {
 }
 
 /// Render events into an existing buffer.
+///
+/// Inline nesting comes through as explicit `EnterInline`/`ExitInline` pairs, so each emits exactly
+/// one tag and HTML nesting is exact. Two inline kinds need buffering: inside a `Code` span text is
+/// escaped raw (no inner tags occur), and inside an `Image` span the inner text is *accumulated*
+/// into the `alt` attribute rather than rendered, then emitted as a single `<img …/>`.
 pub fn render_into(out: &mut String, events: &[Event]) {
-    let mut in_code = false;
-    let mut list_stack: Vec<bool> = Vec::new(); // true = ordered
+    // `list_stack`: one `bool` per open list — `true` = ordered (`<ol>`), `false` = bullet (`<ul>`).
+    let mut list_stack: Vec<bool> = Vec::new();
+    // `image_stack`: one frame per in-progress image, buffering the plain-text `alt` for `![…](…)`.
+    let mut image_stack: Vec<ImageFrame> = Vec::new();
 
     for ev in events {
+        // While inside an image, suppress all tag output and accumulate inner text into `alt`.
+        if let Some(frame) = image_stack.last_mut() {
+            match ev {
+                Event::ExitInline {
+                    inline: Inline::Image(_),
+                } => {
+                    let frame = image_stack.pop().expect("image frame");
+                    emit_image(out, &frame);
+                    continue;
+                }
+                Event::EnterInline {
+                    inline: Inline::Image(link),
+                    ..
+                } => {
+                    // Nested image: start a new alt-accumulation frame.
+                    image_stack.push(ImageFrame::new(link.clone()));
+                    continue;
+                }
+                Event::Text { text, .. } => {
+                    frame.alt.push_str(text);
+                    continue;
+                }
+                Event::SoftBreak => {
+                    frame.alt.push('\n');
+                    continue;
+                }
+                Event::LineBreak => {
+                    frame.alt.push('\n');
+                    continue;
+                }
+                // Other enter/exit inlines inside an image contribute no alt text (their text
+                // children still flow through the `Text` arm above).
+                Event::EnterInline { .. } | Event::ExitInline { .. } => continue,
+                _ => continue,
+            }
+        }
+
         match ev {
             Event::EnterBlock { block, data, .. } => match block {
                 BlockKind::Document => {}
@@ -47,7 +91,6 @@ pub fn render_into(out: &mut String, events: &[Event]) {
                 }
                 BlockKind::ListItem => out.push_str("<li>"),
                 BlockKind::FencedCode => {
-                    in_code = true;
                     let lang = data.info.split_whitespace().next().unwrap_or("");
                     if lang.is_empty() {
                         out.push_str("<pre><code>");
@@ -56,7 +99,6 @@ pub fn render_into(out: &mut String, events: &[Event]) {
                     }
                 }
                 BlockKind::IndentedCode => {
-                    in_code = true;
                     out.push_str("<pre><code>");
                 }
                 BlockKind::HtmlBlock => {}
@@ -77,22 +119,70 @@ pub fn render_into(out: &mut String, events: &[Event]) {
                 }
                 BlockKind::ListItem => out.push_str("</li>\n"),
                 BlockKind::FencedCode | BlockKind::IndentedCode => {
-                    in_code = false;
                     out.push_str("</code></pre>\n");
                 }
                 _ => {}
             },
-            Event::Text { text, style, .. } => {
-                if in_code {
-                    out.push_str(&escape(text));
-                } else {
-                    push_styled(out, text, style);
-                }
+            Event::Text { text, .. } => {
+                // Every `Text` escapes raw: regular text, block-level code (fenced/indented), and
+                // the text inside an inline `Code` span all want HTML-escaped output with no inner
+                // markup, and emphasis/links arrive as their own enter/exit events.
+                out.push_str(&escape(text));
             }
+            Event::EnterInline { inline, .. } => match inline {
+                Inline::Emphasis => out.push_str("<em>"),
+                Inline::Strong => out.push_str("<strong>"),
+                Inline::Strikethrough => out.push_str("<del>"),
+                Inline::Code => out.push_str("<code>"),
+                Inline::Link(Link { href, title, .. }) => {
+                    out.push_str(&format!("<a href=\"{}\"", escape_attr(href)));
+                    if !title.is_empty() {
+                        out.push_str(&format!(" title=\"{}\"", escape_attr(title)));
+                    }
+                    out.push('>');
+                }
+                Inline::Image(link) => image_stack.push(ImageFrame::new(link.clone())),
+            },
+            Event::ExitInline { inline } => match inline {
+                Inline::Emphasis => out.push_str("</em>"),
+                Inline::Strong => out.push_str("</strong>"),
+                Inline::Strikethrough => out.push_str("</del>"),
+                Inline::Code => out.push_str("</code>"),
+                Inline::Link(_) => out.push_str("</a>"),
+                // An image's `ExitInline` is handled by the suppression branch above; reaching here
+                // would mean an unbalanced stream, so do nothing.
+                Inline::Image(_) => {}
+            },
             Event::SoftBreak => out.push('\n'),
             Event::LineBreak => out.push_str("<br />\n"),
         }
     }
+}
+
+/// A buffered image span: its target plus the plain text accumulated for the `alt` attribute.
+struct ImageFrame {
+    link: Link,
+    alt: String,
+}
+
+impl ImageFrame {
+    fn new(link: Link) -> Self {
+        ImageFrame {
+            link,
+            alt: String::new(),
+        }
+    }
+}
+
+/// Emit a completed `<img …/>` from a buffered frame. `alt` is the plain-text rendering of the
+/// image's inner content (CommonMark renders image descriptions as plain text).
+fn emit_image(out: &mut String, frame: &ImageFrame) {
+    out.push_str(&format!("<img src=\"{}\"", escape_attr(&frame.link.href)));
+    out.push_str(&format!(" alt=\"{}\"", escape_attr(&frame.alt)));
+    if !frame.link.title.is_empty() {
+        out.push_str(&format!(" title=\"{}\"", escape_attr(&frame.link.title)));
+    }
+    out.push_str(" />");
 }
 
 /// Track the open heading level via a tiny side-channel: the last `<hN>` written. Rather than thread
@@ -108,53 +198,6 @@ fn close_heading(out: &mut String) {
         }
     }
     out.push_str("</h1>\n");
-}
-
-fn push_styled(out: &mut String, text: &str, style: &InlineStyle) {
-    if style.code {
-        out.push_str("<code>");
-        out.push_str(&escape(text));
-        out.push_str("</code>");
-        return;
-    }
-    let (open, close) = tags(style);
-    out.push_str(&open);
-    out.push_str(&escape(text));
-    out.push_str(&close);
-}
-
-fn tags(style: &InlineStyle) -> (String, String) {
-    let mut open = String::new();
-    let mut close = String::new();
-    if let Some(Link { href, title, image }) = &style.link {
-        if *image {
-            // images are emitted as <img>; handled simply
-            return (
-                format!("<img src=\"{}\" alt=\"", escape_attr(href)),
-                "\" />".to_string(),
-            );
-        }
-        let t = if title.is_empty() {
-            String::new()
-        } else {
-            format!(" title=\"{}\"", escape_attr(title))
-        };
-        open.push_str(&format!("<a href=\"{}\"{}>", escape_attr(href), t));
-        close.insert_str(0, "</a>");
-    }
-    if style.strikethrough {
-        open.push_str("<del>");
-        close.insert_str(0, "</del>");
-    }
-    if style.emphasis {
-        open.push_str("<em>");
-        close.insert_str(0, "</em>");
-    }
-    if style.strong {
-        open.push_str("<strong>");
-        close.insert_str(0, "</strong>");
-    }
-    (open, close)
 }
 
 fn escape(s: &str) -> String {

@@ -16,7 +16,9 @@ mod inline;
 mod parser;
 
 pub use block::StreamParser;
-pub use event::{Alignment, BlockData, BlockKind, Event, InlineStyle, Link, ListData, Span};
+pub use event::{
+    Alignment, BlockData, BlockKind, Event, Inline, InlineStyle, Link, ListData, Span,
+};
 pub use parser::Parser;
 
 /// Parse a complete document to a `Vec<Event>` (convenience over the streaming API).

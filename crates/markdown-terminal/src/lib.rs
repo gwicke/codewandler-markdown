@@ -234,6 +234,10 @@ impl Renderer {
                     self.segments.push((text.clone(), style.clone()));
                 }
             }
+            // Inline nesting is tracked by the parser; the terminal renderer reads cumulative
+            // styling off each `Text` event, so the enter/exit markers are no-ops here.
+            Event::EnterInline { .. } => {}
+            Event::ExitInline { .. } => {}
             Event::SoftBreak => {
                 if !self.in_code {
                     self.segments

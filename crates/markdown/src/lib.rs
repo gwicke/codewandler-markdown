@@ -12,7 +12,7 @@
 
 #![forbid(unsafe_code)]
 
-pub use markdown_stream::{self as stream, Event, Parser, StreamParser};
+pub use markdown_stream::{self as stream, Event, Inline, InlineStyle, Link, Parser, StreamParser};
 pub use markdown_terminal::Theme;
 
 /// Parse `input` and render it to ANSI terminal output.

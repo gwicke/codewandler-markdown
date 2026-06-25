@@ -62,6 +62,21 @@ pub struct Link {
     pub image: bool,
 }
 
+/// The kind of inline span an `EnterInline`/`ExitInline` event opens or closes.
+///
+/// Unlike the cumulative [`InlineStyle`] flags carried on `Text` (which a flat renderer reads),
+/// these events make nesting *explicit*: an HTML renderer emits exactly one tag per enter/exit, so
+/// `*a **b** c*` nests as `<em>a <strong>b</strong> c</em>` rather than three independent runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Inline {
+    Emphasis,
+    Strong,
+    Strikethrough,
+    Code,
+    Link(Link),
+    Image(Link),
+}
+
 /// Inline styling carried on a `Text` event. Multiple flags may apply at once
 /// (e.g. bold + italic). `link` is set for text inside a link/image.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -112,6 +127,15 @@ pub enum Event {
         text: String,
         style: InlineStyle,
         span: Span,
+    },
+    /// Open an inline span (emphasis, strong, link, …). Balanced by a matching `ExitInline`.
+    EnterInline {
+        inline: Inline,
+        span: Span,
+    },
+    /// Close the most recently opened inline span of the matching `inline`.
+    ExitInline {
+        inline: Inline,
     },
     /// A newline within a paragraph (rendered as a space / `\n` in HTML).
     SoftBreak,
