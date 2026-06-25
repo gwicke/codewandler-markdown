@@ -143,7 +143,7 @@ impl Renderer {
                         self.pending_gap = true;
                     }
                     BlockKind::Heading => {
-                        let style = format!("{}{}", self.theme.heading, "\x1b[1m");
+                        let style = format!("{}{}", self.theme.heading, self.theme.bold);
                         self.flush_segments(w, Some(&style))?;
                         self.pending_gap = true;
                     }
@@ -273,13 +273,13 @@ impl Renderer {
             codes.push_str(bs);
         }
         if style.strong {
-            codes.push_str("\x1b[1m");
+            codes.push_str(self.theme.bold);
         }
         if style.emphasis {
-            codes.push_str("\x1b[3m");
+            codes.push_str(self.theme.italic);
         }
         if style.strikethrough {
-            codes.push_str("\x1b[9m");
+            codes.push_str(self.theme.strike);
         }
         if style.code {
             codes.push_str(self.theme.code);

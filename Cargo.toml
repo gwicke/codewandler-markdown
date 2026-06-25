@@ -5,6 +5,7 @@ members = [
     "crates/markdown-html",
     "crates/markdown-terminal",
     "crates/markdown",
+    "crates/mdview",
 ]
 
 [workspace.package]

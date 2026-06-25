@@ -10,4 +10,3 @@ description = "Render a markdown-stream event stream to styled terminal output (
 [dependencies]
 markdown-stream.workspace = true
 unicode-width.workspace = true
-is-terminal.workspace = true

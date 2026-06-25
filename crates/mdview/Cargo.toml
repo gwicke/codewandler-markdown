@@ -1,0 +1,16 @@
+[package]
+name = "mdview"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Render Markdown to the terminal (streaming) — the CLI front-end for the markdown library"
+
+[[bin]]
+name = "mdview"
+path = "src/main.rs"
+
+[dependencies]
+markdown-stream.workspace = true
+markdown-terminal.workspace = true
