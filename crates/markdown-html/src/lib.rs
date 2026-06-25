@@ -8,10 +8,19 @@
 
 use markdown_stream::{BlockKind, Event, Inline, Link};
 
-/// Render a sequence of events to an HTML string.
+/// Render a sequence of events to an HTML string (CommonMark).
 pub fn render(events: &[Event]) -> String {
     let mut out = String::new();
     render_into(&mut out, events);
+    out
+}
+
+/// Render a sequence of events to an HTML string with GFM's disallowed-raw-HTML tag filter applied:
+/// the leading `<` of a `<title>`/`<textarea>`/`<style>`/`<xmp>`/`<iframe>`/`<noembed>`/`<noframes>`/
+/// `<script>`/`<plaintext>` tag in raw HTML output is escaped to `&lt;`.
+pub fn render_gfm(events: &[Event]) -> String {
+    let mut out = String::new();
+    render_with(&mut out, events, true);
     out
 }
 
@@ -22,13 +31,20 @@ pub fn render(events: &[Event]) -> String {
 /// escaped raw (no inner tags occur), and inside an `Image` span the inner text is *accumulated*
 /// into the `alt` attribute rather than rendered, then emitted as a single `<img …/>`.
 pub fn render_into(out: &mut String, events: &[Event]) {
+    render_with(out, events, false);
+}
+
+/// The rendering core. `gfm` enables the disallowed-raw-HTML tag filter on verbatim HTML output.
+fn render_with(out: &mut String, events: &[Event], gfm: bool) {
     // `list_stack`: one `bool` per open list — `true` = ordered (`<ol>`), `false` = bullet (`<ul>`).
     let mut list_stack: Vec<bool> = Vec::new();
     // `image_stack`: one frame per in-progress image, buffering the plain-text `alt` for `![…](…)`.
     let mut image_stack: Vec<ImageFrame> = Vec::new();
     // Inside a raw HTML block, `Text` is emitted verbatim (no escaping) — the block's lines *are*
-    // the output.
+    // the output. `html_filter` additionally tracks whether the GFM tag filter applies to this block
+    // (it does for all but the raw-text `<script>`/`<style>`/`<pre>`/`<textarea>` blocks).
     let mut in_html = false;
+    let mut html_filter = false;
 
     for ev in events {
         // While inside an image, suppress all tag output and accumulate inner text into `alt`.
@@ -104,7 +120,11 @@ pub fn render_into(out: &mut String, events: &[Event]) {
                 BlockKind::IndentedCode => {
                     out.push_str("<pre><code>");
                 }
-                BlockKind::HtmlBlock => in_html = true,
+                BlockKind::HtmlBlock => {
+                    in_html = true;
+                    // Filter every HTML block except the verbatim raw-text elements.
+                    html_filter = gfm && !data.html_raw_text;
+                }
                 BlockKind::Table | BlockKind::TableRow | BlockKind::TableCell => {}
             },
             Event::ExitBlock { block, .. } => match block {
@@ -124,7 +144,10 @@ pub fn render_into(out: &mut String, events: &[Event]) {
                 BlockKind::FencedCode | BlockKind::IndentedCode => {
                     out.push_str("</code></pre>\n");
                 }
-                BlockKind::HtmlBlock => in_html = false,
+                BlockKind::HtmlBlock => {
+                    in_html = false;
+                    html_filter = false;
+                }
                 _ => {}
             },
             Event::Text { text, style, .. } => {
@@ -133,7 +156,17 @@ pub fn render_into(out: &mut String, events: &[Event]) {
                 // block-level code (fenced/indented), and the text inside an inline `Code` span all
                 // want HTML-escaped output with no inner markup, and emphasis/links arrive as their
                 // own enter/exit events.
-                if in_html || style.raw_html {
+                if in_html {
+                    // HTML *block* content is emitted verbatim, but GFM filters the disallowed tags
+                    // in every block except the verbatim raw-text (`<script>`/`<style>`/…) elements.
+                    if html_filter {
+                        out.push_str(&tagfilter(text));
+                    } else {
+                        out.push_str(text);
+                    }
+                } else if style.raw_html && gfm {
+                    out.push_str(&tagfilter(text));
+                } else if style.raw_html {
                     out.push_str(text);
                 } else {
                     out.push_str(&escape(text));
@@ -208,6 +241,56 @@ fn close_heading(out: &mut String) {
         }
     }
     out.push_str("</h1>\n");
+}
+
+/// GFM disallowed raw HTML tags whose leading `<` is escaped to `&lt;` in the output.
+const DISALLOWED_TAGS: &[&str] = &[
+    "title",
+    "textarea",
+    "style",
+    "xmp",
+    "iframe",
+    "noembed",
+    "noframes",
+    "script",
+    "plaintext",
+];
+
+/// Apply GFM's tag filter to a run of verbatim HTML: each `<` (or `</`) that opens a disallowed tag
+/// (`<title>`, `<script>`, …) has its `<` rewritten to `&lt;`. A tag matches only when the name is
+/// immediately followed by a delimiter (whitespace, `>`, `/`, or end of input), matching cmark-gfm.
+fn tagfilter(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'<' {
+            // Skip an optional closing-tag slash, then try to match a disallowed tag name.
+            let name_start = if b.get(i + 1) == Some(&b'/') {
+                i + 2
+            } else {
+                i + 1
+            };
+            if let Some(tag) = DISALLOWED_TAGS.iter().find(|&&t| {
+                let end = name_start + t.len();
+                end <= b.len()
+                    && b[name_start..end].eq_ignore_ascii_case(t.as_bytes())
+                    && b.get(end)
+                        .is_none_or(|&c| matches!(c, b' ' | b'\t' | b'\n' | b'\r' | b'>' | b'/'))
+            }) {
+                // Escape the `<`; keep the `/` (if any) and the tag name verbatim.
+                out.push_str("&lt;");
+                let _ = tag;
+                i += 1;
+                continue;
+            }
+        }
+        // Copy the next (possibly multi-byte) character verbatim.
+        let ch = s[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
 }
 
 fn escape(s: &str) -> String {

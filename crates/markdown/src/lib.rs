@@ -20,9 +20,15 @@ pub fn render_string(input: &str) -> String {
     markdown_terminal::render(&stream::parse(input))
 }
 
-/// Parse `input` and render it to HTML.
+/// Parse `input` and render it to HTML (CommonMark).
 pub fn html_string(input: &str) -> String {
     markdown_html::render(&stream::parse(input))
+}
+
+/// Parse `input` with GFM extensions and render it to HTML, applying the GFM disallowed-raw-HTML tag
+/// filter. Use this for GitHub-Flavored Markdown; [`html_string`] stays pure CommonMark.
+pub fn html_string_gfm(input: &str) -> String {
+    markdown_html::render_gfm(&stream::parse_gfm(input))
 }
 
 /// Parse `input` into the raw event stream.

@@ -15,6 +15,7 @@
 //! 3. [`flatten`] — walk the resolved token tree and emit events, stamping each `Text` with the
 //!    cumulative [`InlineStyle`] of the enclosing spans so the flat (terminal) renderer is unchanged.
 
+use crate::entity::decode_entity;
 use crate::event::{Event, Inline, InlineStyle, Link, LinkDef, Span};
 use crate::linkref;
 use std::collections::HashMap;
@@ -24,9 +25,10 @@ use std::collections::HashMap;
 type Refs = HashMap<String, LinkDef>;
 
 /// Parse the inline content of `text` (already joined with `\n` for multi-line paragraphs) under the
-/// given base `style`, resolving reference links against `refs`, appending events to `out`.
-pub fn parse(text: &str, style: &InlineStyle, refs: &Refs, out: &mut Vec<Event>) {
-    let mut tokens = scan(text, refs);
+/// given base `style`, resolving reference links against `refs`, appending events to `out`. `gfm`
+/// enables the GFM extended (bare) autolink syntax.
+pub fn parse(text: &str, style: &InlineStyle, refs: &Refs, gfm: bool, out: &mut Vec<Event>) {
+    let mut tokens = scan(text, refs, gfm);
     process_emphasis(&mut tokens, 0);
     flatten(&tokens, style, out);
 }
@@ -49,8 +51,10 @@ enum Token {
     HardBreak,
     /// A link or image with its already-parsed inner tokens.
     Link { link: Link, inner: Vec<Token> },
-    /// An autolink — rendered as a link whose text equals its destination.
-    Autolink { href: String },
+    /// An autolink — a link whose visible text is `text` and whose destination is `href` (the two
+    /// differ for an email autolink, where the href gains a `mailto:` prefix, and whenever the
+    /// destination needs percent-encoding the text does not).
+    Autolink { text: String, href: String },
     /// Inline raw HTML (an open/closing tag, comment, PI, declaration, or CDATA): emitted verbatim,
     /// *unescaped*, by the HTML renderer.
     RawHtml(String),
@@ -90,8 +94,9 @@ struct Delim {
 // ---------------------------------------------------------------------------------------------
 
 /// Scan `text` left to right into a flat token list, resolving every non-emphasis construct.
-/// `refs` resolves reference links/images encountered along the way.
-fn scan(text: &str, refs: &Refs) -> Vec<Token> {
+/// `refs` resolves reference links/images encountered along the way; `gfm` enables the extended
+/// (bare) autolink syntax.
+fn scan(text: &str, refs: &Refs, gfm: bool) -> Vec<Token> {
     let b = text.as_bytes();
     let mut tokens: Vec<Token> = Vec::new();
     let mut buf = String::new();
@@ -108,6 +113,19 @@ fn scan(text: &str, refs: &Refs) -> Vec<Token> {
 
     while i < b.len() {
         let c = b[i];
+
+        // GFM extended autolink (`www.…`, `http(s)://…`, `ftp://…`, bare email). Attempted only in
+        // GFM mode, at a valid left boundary, and only *consumes* on a successful match — otherwise
+        // we fall through so the byte is handled normally (e.g. `_` stays an emphasis delimiter).
+        if gfm && is_gfm_autolink_start(b, i) && gfm_autolink_boundary_ok(text, i) {
+            if let Some((tok, end)) = try_gfm_autolink(text, i) {
+                flush!();
+                tokens.push(tok);
+                i = end;
+                continue;
+            }
+        }
+
         match c {
             // Backslash escape of an ASCII punctuation char → the literal char.
             b'\\' if i + 1 < b.len() && is_ascii_punct(b[i + 1]) => {
@@ -136,7 +154,9 @@ fn scan(text: &str, refs: &Refs) -> Vec<Token> {
                 i += 1;
                 i = skip_line_lead(b, i);
             }
-            // Code span (longest-match backticks).
+            // Code span: an opening run of `n` backticks pairs with the next run of *exactly* `n`.
+            // When there is no such closing run, the whole opening run is literal and scanning resumes
+            // past it (it is not re-tried as a shorter opener) — so e.g. ```` ```foo`` ```` is all text.
             b'`' => {
                 let n = run_len(b, i, b'`');
                 if let Some(close) = find_code_close(b, i + n, n) {
@@ -144,13 +164,15 @@ fn scan(text: &str, refs: &Refs) -> Vec<Token> {
                     tokens.push(Token::Code(code_span_text(&text[i + n..close])));
                     i = close + n;
                 } else {
-                    buf.push('`');
-                    i += 1;
+                    for _ in 0..n {
+                        buf.push('`');
+                    }
+                    i += n;
                 }
             }
             // Image `![alt](dest)` / `![alt][ref]` / `![ref]`.
             b'!' if i + 1 < b.len() && b[i + 1] == b'[' => {
-                if let Some((tok, consumed)) = try_link(text, i + 1, true, refs) {
+                if let Some((tok, consumed)) = try_link(text, i + 1, true, refs, gfm) {
                     flush!();
                     tokens.push(tok);
                     i += 1 + consumed;
@@ -161,7 +183,7 @@ fn scan(text: &str, refs: &Refs) -> Vec<Token> {
             }
             // Link `[text](dest)` / `[text][ref]` / `[ref]`.
             b'[' => {
-                if let Some((tok, consumed)) = try_link(text, i, false, refs) {
+                if let Some((tok, consumed)) = try_link(text, i, false, refs, gfm) {
                     flush!();
                     tokens.push(tok);
                     i += consumed;
@@ -173,11 +195,9 @@ fn scan(text: &str, refs: &Refs) -> Vec<Token> {
             // Autolink `<scheme:…>` / `<email>`; on failure, inline raw HTML `<tag …>` / `</tag>` /
             // comment / PI / declaration / CDATA.
             b'<' => {
-                if let Some((end, url)) = try_autolink(text, i) {
+                if let Some((end, tok)) = try_autolink(text, i) {
                     flush!();
-                    tokens.push(Token::Autolink {
-                        href: url.to_string(),
-                    });
+                    tokens.push(tok);
                     i = end;
                 } else if let Some(end) = try_raw_html(b, i) {
                     flush!();
@@ -185,6 +205,19 @@ fn scan(text: &str, refs: &Refs) -> Vec<Token> {
                     i = end;
                 } else {
                     buf.push('<');
+                    i += 1;
+                }
+            }
+            // Character reference (`&name;`, `&#DDD;`, `&#xHHH;`): decode to its literal character(s)
+            // and append them to the text buffer. Because the result lands in `buf` (not re-scanned),
+            // a decoded delimiter character (e.g. `&#42;` → `*`) stays literal and never starts a new
+            // construct, matching the spec.
+            b'&' => {
+                if let Some((decoded, len)) = decode_entity(&text[i..]) {
+                    buf.push_str(&decoded);
+                    i += len;
+                } else {
+                    buf.push('&');
                     i += 1;
                 }
             }
@@ -479,24 +512,20 @@ fn flatten(tokens: &[Token], base: &InlineStyle, out: &mut Vec<Event>) {
                     span: Span::default(),
                 });
             }
-            Token::Autolink { href } => {
-                let mut st = base.clone();
-                st.link = Some(Link {
-                    href: href.clone(),
-                    title: String::new(),
-                    image: false,
-                });
+            Token::Autolink { text, href } => {
                 let link = Link {
                     href: href.clone(),
                     title: String::new(),
                     image: false,
                 };
+                let mut st = base.clone();
+                st.link = Some(link.clone());
                 out.push(Event::EnterInline {
                     inline: Inline::Link(link.clone()),
                     span: Span::default(),
                 });
                 out.push(Event::Text {
-                    text: href.clone(),
+                    text: text.clone(),
                     style: st,
                     span: Span::default(),
                 });
@@ -624,7 +653,13 @@ fn code_span_text(s: &str) -> String {
 ///
 /// Inline syntax takes precedence: a `(` immediately after the `]` is tried as an inline
 /// destination first, and only on failure do we fall back to reference resolution.
-fn try_link(text: &str, open: usize, image: bool, refs: &Refs) -> Option<(Token, usize)> {
+fn try_link(
+    text: &str,
+    open: usize,
+    image: bool,
+    refs: &Refs,
+    gfm: bool,
+) -> Option<(Token, usize)> {
     let b = text.as_bytes();
     let close = matching_bracket(b, open)?;
     let label_raw = &text[open + 1..close];
@@ -632,7 +667,7 @@ fn try_link(text: &str, open: usize, image: bool, refs: &Refs) -> Option<(Token,
     // Scan the bracketed content once; reused as the link/image inner tokens. A *link* (not an
     // image) may not contain another link — the inner link binds tighter — so if it does we reject
     // the outer link and let scanning fall through to the literal `[` and re-match the inner link.
-    let inner = scan_inner(label_raw, refs);
+    let inner = scan_inner(label_raw, refs, gfm);
     let nested_link = contains_link(&inner);
     let make = |link: Link, end: usize| {
         if !image && nested_link {
@@ -682,8 +717,8 @@ fn try_link(text: &str, open: usize, image: bool, refs: &Refs) -> Option<(Token,
 }
 
 /// Parse and scan a link/image label's inner content (emphasis resolved).
-fn scan_inner(label: &str, refs: &Refs) -> Vec<Token> {
-    let mut inner = scan(label, refs);
+fn scan_inner(label: &str, refs: &Refs, gfm: bool) -> Vec<Token> {
+    let mut inner = scan(label, refs, gfm);
     process_emphasis(&mut inner, 0);
     inner
 }
@@ -1021,20 +1056,324 @@ fn skip_html_ws(b: &[u8], mut i: usize) -> usize {
     i
 }
 
-fn try_autolink(text: &str, lt: usize) -> Option<(usize, &str)> {
+/// Try to parse a CommonMark autolink at the `<` indexed by `lt`. Returns the offset just past the
+/// closing `>` and the resulting [`Token::Autolink`]. Two forms:
+///
+///   * **URI** `<scheme:rest>` — `scheme` is an ASCII letter then 1–31 of letter/digit/`+`/`.`/`-`
+///     (2–32 chars total), and `rest` contains no whitespace, no `<`, and no control characters. The
+///     destination is the inner text percent-encoded (backslashes are *not* escapes here).
+///   * **email** `<addr>` — `addr` matches the HTML5 email production; the destination is
+///     `mailto:addr`.
+fn try_autolink(text: &str, lt: usize) -> Option<(usize, Token)> {
     let b = text.as_bytes();
     let gt = find_byte(b, lt + 1, b'>')?;
     let inner = &text[lt + 1..gt];
-    let has_ws = inner.contains(char::is_whitespace);
-    let url_like =
-        (inner.starts_with("http://") || inner.starts_with("https://") || inner.contains("://"))
-            && !has_ws;
-    let email_like = inner.contains('@') && !has_ws && !inner.contains('/');
-    if url_like || email_like {
-        Some((gt + 1, inner))
+    if is_uri_autolink(inner) {
+        Some((
+            gt + 1,
+            Token::Autolink {
+                text: inner.to_string(),
+                href: linkref::normalize_autolink(inner),
+            },
+        ))
+    } else if is_email_autolink(inner) {
+        Some((
+            gt + 1,
+            Token::Autolink {
+                text: inner.to_string(),
+                href: format!("mailto:{inner}"),
+            },
+        ))
     } else {
         None
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// GFM extended autolinks (`www.`, `http(s)://`, `ftp://`, bare email)
+// ---------------------------------------------------------------------------------------------
+
+/// A GFM extended autolink may only begin at a valid left boundary: the start of the text, or
+/// immediately after whitespace or one of `*`, `_`, `~`, `(`.
+fn gfm_autolink_boundary_ok(text: &str, i: usize) -> bool {
+    match char_before(text, i) {
+        None => true,
+        Some(c) => c.is_whitespace() || matches!(c, '*' | '_' | '~' | '('),
+    }
+}
+
+/// A quick first-byte gate: could a GFM extended autolink start at `i`? (`w` for `www`, `h`/`f` for
+/// the URL schemes, or an email local-part character.)
+fn is_gfm_autolink_start(b: &[u8], i: usize) -> bool {
+    matches!(b[i], b'w' | b'W' | b'h' | b'H' | b'f' | b'F') || is_email_local_char(b[i])
+}
+
+/// Try to parse a GFM extended autolink at `i`. Returns the link token and the offset just past it.
+fn try_gfm_autolink(text: &str, i: usize) -> Option<(Token, usize)> {
+    // URL autolinks take precedence over the bare-email form (a scheme `http://a@b` is a URL).
+    if let Some((end, scheme_len)) = gfm_url_extent(text, i) {
+        // `www.` autolinks get an implicit `http://` scheme on the href; explicit schemes keep theirs.
+        let raw = &text[i..end];
+        let href = if scheme_len == 0 {
+            format!("http://{}", linkref::normalize_autolink(raw))
+        } else {
+            linkref::normalize_autolink(raw)
+        };
+        return Some((
+            Token::Autolink {
+                text: raw.to_string(),
+                href,
+            },
+            end,
+        ));
+    }
+    // Bare email autolink.
+    if let Some(end) = gfm_email_extent(text, i) {
+        let raw = &text[i..end];
+        return Some((
+            Token::Autolink {
+                text: raw.to_string(),
+                href: format!("mailto:{raw}"),
+            },
+            end,
+        ));
+    }
+    None
+}
+
+/// Find the extent of a GFM URL autolink starting at `i`, returning `(end, scheme_len)` where
+/// `scheme_len` is 0 for a `www.` autolink (no explicit scheme) or the byte length of the matched
+/// `http://` / `https://` / `ftp://` scheme. Applies the GFM domain rule and trailing-punctuation /
+/// paren-balancing / entity trimming.
+fn gfm_url_extent(text: &str, i: usize) -> Option<(usize, usize)> {
+    let rest = &text[i..];
+    let lower = rest.to_ascii_lowercase();
+    let scheme_len = if lower.starts_with("http://") {
+        7
+    } else if lower.starts_with("https://") {
+        8
+    } else if lower.starts_with("ftp://") {
+        6
+    } else if lower.starts_with("www.") {
+        0
+    } else {
+        return None;
+    };
+
+    let domain_start = scheme_len;
+    let b = rest.as_bytes();
+    // Scan the whole URL up to whitespace or `<` (the autolink terminators), then trim the GFM
+    // trailing characters (punctuation, unbalanced `)`, entity suffix) down to just after the scheme.
+    let mut k = domain_start;
+    while k < b.len() && !b[k].is_ascii_whitespace() && b[k] != b'<' {
+        k += 1;
+    }
+    let end = trim_gfm_url_tail(rest, domain_start, k);
+    if end <= domain_start {
+        return None;
+    }
+
+    // The domain is everything from the scheme to the first `/` (or the end), and must be valid.
+    let after = &rest[domain_start..end];
+    let domain = after.split('/').next().unwrap_or(after);
+    if !is_valid_gfm_domain(domain) {
+        return None;
+    }
+    Some((i + end, scheme_len))
+}
+
+/// Trim a GFM URL autolink's trailing characters: trailing `?!.,:*_~`, unbalanced `)`, and an
+/// entity-like `&…;` suffix are not part of the link. `path_start` is where the path begins (so the
+/// domain is never trimmed below it); `end` is the provisional end. Returns the trimmed end offset.
+fn trim_gfm_url_tail(rest: &str, path_start: usize, mut end: usize) -> usize {
+    let b = rest.as_bytes();
+    let min = path_start;
+    loop {
+        let before = end;
+        // Trailing punctuation that is never part of the link.
+        while end > min
+            && matches!(
+                b[end - 1],
+                b'?' | b'!' | b'.' | b',' | b':' | b'*' | b'_' | b'~'
+            )
+        {
+            end -= 1;
+        }
+        // Unbalanced trailing `)`: while there are more `)` than `(` in the link, drop a `)`.
+        while end > min && b[end - 1] == b')' {
+            let opens = rest[..end].bytes().filter(|&c| c == b'(').count();
+            let closes = rest[..end].bytes().filter(|&c| c == b')').count();
+            if closes > opens {
+                end -= 1;
+            } else {
+                break;
+            }
+        }
+        // A trailing entity reference `&name;` (or `&#...;`) is excluded from the link.
+        if end > min && b[end - 1] == b';' {
+            if let Some(amp) = rest[..end].rfind('&') {
+                if amp >= min {
+                    let candidate = &rest[amp..end];
+                    if candidate[1..candidate.len() - 1]
+                        .bytes()
+                        .all(|c| c.is_ascii_alphanumeric() || c == b'#')
+                        && candidate.len() > 2
+                    {
+                        end = amp;
+                    }
+                }
+            }
+        }
+        if end == before {
+            break;
+        }
+    }
+    end
+}
+
+/// A GFM autolink domain: at least one dot, each label of letters/digits/`-`/`_`, and the *last two*
+/// labels may not contain `_`. Empty labels (a trailing or doubled dot) are rejected.
+fn is_valid_gfm_domain(domain: &str) -> bool {
+    let labels: Vec<&str> = domain.trim_end_matches('.').split('.').collect();
+    if labels.len() < 2 || labels.iter().any(|l| l.is_empty()) {
+        return false;
+    }
+    if labels.iter().any(|l| {
+        !l.bytes()
+            .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
+    }) {
+        return false;
+    }
+    // The last two labels must not contain underscores.
+    let n = labels.len();
+    !labels[n - 1].contains('_') && !labels[n - 2].contains('_')
+}
+
+/// Find the extent of a bare GFM email autolink starting at `i`, or `None`. The boundary already
+/// guaranteed a valid left edge; the address runs to the first character outside the email charset.
+fn gfm_email_extent(text: &str, i: usize) -> Option<usize> {
+    let b = text.as_bytes();
+    // Local part: one or more email chars (no `@`).
+    let mut j = i;
+    while j < b.len() && is_email_local_char(b[j]) {
+        j += 1;
+    }
+    if j == i || b.get(j) != Some(&b'@') {
+        return None;
+    }
+    j += 1;
+    // Domain: labels of letters/digits/`-`/`_`/`.`. A trailing `.` is excluded from the autolink
+    // (`a.b.` links `a.b`), but a trailing `-`/`_` makes the whole address invalid.
+    let dom_start = j;
+    while j < b.len() && (b[j].is_ascii_alphanumeric() || matches!(b[j], b'-' | b'_' | b'.')) {
+        j += 1;
+    }
+    // Drop only a trailing `.`.
+    while j > dom_start && b[j - 1] == b'.' {
+        j -= 1;
+    }
+    let domain = &text[dom_start..j];
+    if domain.is_empty() {
+        return None;
+    }
+    // The GFM email domain: ≥2 dot-separated labels of letters/digits/`-`/`_`, none empty; the final
+    // label may not end in `-` or `_`, and `_` is not allowed in the last two labels.
+    let labels: Vec<&str> = domain.split('.').collect();
+    if labels.len() < 2 || labels.iter().any(|l| l.is_empty()) {
+        return None;
+    }
+    if labels.iter().any(|l| {
+        !l.bytes()
+            .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
+    }) {
+        return None;
+    }
+    let n = labels.len();
+    let last = labels[n - 1].as_bytes();
+    if matches!(last[last.len() - 1], b'-' | b'_')
+        || labels[n - 1].contains('_')
+        || labels[n - 2].contains('_')
+    {
+        return None;
+    }
+    Some(j)
+}
+
+/// A character allowed in the local part of a (bare) GFM email autolink.
+fn is_email_local_char(c: u8) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, b'.' | b'-' | b'_' | b'+')
+}
+
+/// Does `inner` (the text between `<` and `>`) form a CommonMark URI autolink?
+fn is_uri_autolink(inner: &str) -> bool {
+    let b = inner.as_bytes();
+    // Scheme: a letter, then 1–31 of letter/digit/`+`/`.`/`-`, then a `:`.
+    if b.first().is_none_or(|c| !c.is_ascii_alphabetic()) {
+        return false;
+    }
+    let mut i = 1;
+    while i < b.len() && (b[i].is_ascii_alphanumeric() || matches!(b[i], b'+' | b'.' | b'-')) {
+        i += 1;
+    }
+    // Scheme length is `i` (chars before the colon); must be 2–32 and followed by `:`.
+    if !(2..=32).contains(&i) || b.get(i) != Some(&b':') {
+        return false;
+    }
+    // The remainder may not contain whitespace, `<`, or ASCII control characters.
+    inner[i + 1..]
+        .bytes()
+        .all(|c| c > 0x20 && c != b'<' && c != 0x7f)
+}
+
+/// Does `inner` form a CommonMark email autolink? Implements the spec's email production directly.
+fn is_email_autolink(inner: &str) -> bool {
+    let Some((local, domain)) = inner.split_once('@') else {
+        return false;
+    };
+    if local.is_empty()
+        || !local.bytes().all(|c| {
+            c.is_ascii_alphanumeric()
+                || matches!(
+                    c,
+                    b'.' | b'!'
+                        | b'#'
+                        | b'$'
+                        | b'%'
+                        | b'&'
+                        | b'\''
+                        | b'*'
+                        | b'+'
+                        | b'/'
+                        | b'='
+                        | b'?'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'{'
+                        | b'|'
+                        | b'}'
+                        | b'~'
+                        | b'-'
+                )
+        })
+    {
+        return false;
+    }
+    // Domain: one or more `.`-separated labels of letter/digit/`-`, each not starting or ending with
+    // `-` and at most 63 chars.
+    if domain.is_empty() {
+        return false;
+    }
+    domain.split('.').all(is_email_label)
+}
+
+/// One label of an email autolink's domain: 1–63 of letter/digit/`-`, not edged with `-`.
+fn is_email_label(label: &str) -> bool {
+    let b = label.as_bytes();
+    if b.is_empty() || b.len() > 63 || b[0] == b'-' || b[b.len() - 1] == b'-' {
+        return false;
+    }
+    b.iter().all(|&c| c.is_ascii_alphanumeric() || c == b'-')
 }
 
 /// A coarse but corpus-adequate test for non-ASCII Unicode punctuation/symbol characters used by the

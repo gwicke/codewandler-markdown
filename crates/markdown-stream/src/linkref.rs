@@ -173,6 +173,28 @@ pub fn unescape_string(s: &str) -> String {
     out
 }
 
+/// Percent-encode an autolink URI: like a normalised destination but *without* resolving backslash
+/// escapes (a backslash in an autolink is an ordinary character that gets percent-encoded to `%5C`).
+/// Entity/character references inside the URI are still decoded to their value first.
+pub fn normalize_autolink(raw: &str) -> String {
+    let mut decoded = String::with_capacity(raw.len());
+    let b = raw.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'&' {
+            if let Some((ch, len)) = crate::entity::decode_entity(&raw[i..]) {
+                decoded.push_str(&ch);
+                i += len;
+                continue;
+            }
+        }
+        let ch = raw[i..].chars().next().unwrap();
+        decoded.push(ch);
+        i += ch.len_utf8();
+    }
+    percent_encode_uri(&decoded)
+}
+
 /// Percent-encode a URI the way the CommonMark reference renderer does: keep ASCII alphanumerics and
 /// a fixed set of "safe" punctuation, leave existing valid `%XX` escapes intact, and `%`-encode
 /// every other byte (including all non-ASCII, which is first UTF-8 encoded).

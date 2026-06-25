@@ -2,11 +2,20 @@
 //! as parsing it split at *any* byte boundary. This is the library's defining invariant — it holds
 //! at every milestone, including the empty-stream scaffold.
 
-use markdown_stream::{parse, Event, Parser, StreamParser};
+use markdown_stream::{parse, parse_gfm, Event, Parser, StreamParser};
 
 fn parse_split(input: &str, at: usize) -> Vec<Event> {
     let b = input.as_bytes();
     let mut p = StreamParser::new();
+    let mut ev = p.write(&b[..at]);
+    ev.extend(p.write(&b[at..]));
+    ev.extend(p.flush());
+    ev
+}
+
+fn parse_split_gfm(input: &str, at: usize) -> Vec<Event> {
+    let b = input.as_bytes();
+    let mut p = StreamParser::new_gfm();
     let mut ev = p.write(&b[..at]);
     ev.extend(p.write(&b[at..]));
     ev.extend(p.flush());
@@ -37,6 +46,11 @@ fn split_equivalence_on_samples() {
         "* foo\n  * bar\n\n  baz\n",
         // A list item whose content is a code block and a blockquote (multiple child blocks).
         "1.  foo\n\n    ```\n    bar\n    ```\n\n    > quux\n",
+        // Character references in general text: named, decimal, and hex, including a decoded
+        // delimiter (`&#42;` → `*`) that must stay literal regardless of the chunk boundary.
+        "&copy; &amp; &#42;foo&#42; &#x41; &nbsp;end\n",
+        // Hard line break (two trailing spaces) — trailing-space accumulation must be chunk-safe.
+        "foo  \nbar\n",
     ];
     for s in samples {
         let whole = parse(s);
@@ -45,6 +59,32 @@ fn split_equivalence_on_samples() {
                 continue;
             }
             assert_eq!(parse_split(s, at), whole, "split at byte {at} of {s:?}");
+        }
+    }
+}
+
+/// The GFM-extension path (extended autolinks, task lists) must be equally chunk-independent.
+#[test]
+fn split_equivalence_gfm_samples() {
+    let samples = [
+        // Extended autolinks: bare `www.`, a scheme URL with trailing punctuation, and a bare email.
+        "Visit www.example.com/a.b. and http://x.org), mail foo@bar.example.com here\n",
+        // Task-list items, tight and nested.
+        "- [ ] todo\n- [x] done\n  - [ ] sub\n",
+        // A checkbox marker that is *not* the first content (so it stays literal).
+        "- text\n\n  [ ] not a task\n",
+    ];
+    for s in samples {
+        let whole = parse_gfm(s);
+        for at in 0..=s.len() {
+            if !s.is_char_boundary(at) {
+                continue;
+            }
+            assert_eq!(
+                parse_split_gfm(s, at),
+                whole,
+                "gfm split at byte {at} of {s:?}"
+            );
         }
     }
 }

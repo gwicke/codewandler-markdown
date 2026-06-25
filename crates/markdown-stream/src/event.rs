@@ -125,6 +125,10 @@ pub struct BlockData {
     pub list: Option<ListData>,
     /// Per-column alignment for `Table`.
     pub alignment: Vec<Alignment>,
+    /// For `HtmlBlock`: `true` when the block is a raw-text element (`<script>`/`<style>`/`<pre>`/
+    /// `<textarea>`), whose content the GFM tag filter leaves untouched. (Other HTML blocks — comments,
+    /// `<blockquote>`, … — are still filtered.)
+    pub html_raw_text: bool,
 }
 
 /// One parser event. The stream is a depth-first walk: every `EnterBlock` is eventually balanced by

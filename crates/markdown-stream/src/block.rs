@@ -40,6 +40,10 @@ pub struct StreamParser {
     /// Link reference definitions seen so far, keyed by normalised label. Populated in line order as
     /// paragraphs are scanned; references resolve against the definitions visible at close time.
     refs: HashMap<String, LinkDef>,
+    /// When set, GFM extensions that are *not* part of CommonMark are enabled: extended (bare)
+    /// autolinks and task-list-item markers. (Strikethrough and tables are always on.) The flag is
+    /// off by default so the plain [`StreamParser::new`] path stays CommonMark-faithful.
+    gfm: bool,
 }
 
 /// One open container in the stack.
@@ -133,8 +137,18 @@ struct Marker {
 }
 
 impl StreamParser {
+    /// A CommonMark parser (GFM-only extensions off).
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A parser with GFM-only extensions enabled (extended autolinks, task-list items). Strikethrough
+    /// and tables are always recognised regardless of this flag.
+    pub fn new_gfm() -> Self {
+        StreamParser {
+            gfm: true,
+            ..Self::default()
+        }
     }
 }
 
@@ -532,10 +546,12 @@ impl StreamParser {
         let indent = cur.indent();
 
         if lazy {
-            // Pure paragraph continuation.
+            // Pure paragraph continuation. Trailing spaces are kept (a two-space run signals a hard
+            // line break, resolved during inline scanning); the final line's trailing run is trimmed
+            // when the paragraph closes.
             if let Leaf::Paragraph(p) = &mut self.leaf {
                 p.push('\n');
-                p.push_str(content.trim_end());
+                p.push_str(&content);
             }
             return;
         }
@@ -554,7 +570,7 @@ impl StreamParser {
         if indent >= TAB {
             if let Leaf::Paragraph(p) = &mut self.leaf {
                 p.push('\n');
-                p.push_str(content.trim_end());
+                p.push_str(&content);
                 return;
             }
             // Otherwise it is an indented code block.
@@ -573,7 +589,23 @@ impl StreamParser {
         if let Some(end) = html_block_start(trimmed, in_paragraph) {
             self.ensure_doc(out);
             self.close_leaf(out);
-            self.emit(out, Event::enter(BlockKind::HtmlBlock));
+            // Raw-text blocks (`<script>`/`<style>`/`<pre>`/`<textarea>`) are exempt from the GFM tag
+            // filter; mark them so the renderer can tell them from other (filtered) HTML blocks.
+            let html_raw_text = matches!(
+                end,
+                HtmlEnd::Marker("</script>" | "</style>" | "</pre>" | "</textarea>")
+            );
+            self.emit(
+                out,
+                Event::EnterBlock {
+                    block: BlockKind::HtmlBlock,
+                    data: BlockData {
+                        html_raw_text,
+                        ..Default::default()
+                    },
+                    span: Span::default(),
+                },
+            );
             self.emit(out, Event::text(format!("{trimmed}\n")));
             match end {
                 HtmlEnd::Marker(marker) if contains_ci(trimmed, marker) => {
@@ -680,7 +712,7 @@ impl StreamParser {
                     }
                 }
                 p.push('\n');
-                p.push_str(content.trim_end());
+                p.push_str(&content);
             }
             _ => {
                 // Blank remaining content (e.g. an empty list marker line `-   `) opens no
@@ -689,7 +721,9 @@ impl StreamParser {
                     return;
                 }
                 self.ensure_doc(out);
-                self.leaf = Leaf::Paragraph(trimmed.trim_end().to_string());
+                // Keep the first line's trailing spaces (a hard-break signal); leading whitespace was
+                // already stripped by `trimmed`.
+                self.leaf = Leaf::Paragraph(trimmed.to_string());
             }
         }
     }
@@ -772,6 +806,16 @@ impl StreamParser {
         if let Some(frame) = self.innermost_list_mut() {
             frame.events.push(BufEvent::ItemEnd);
         }
+    }
+
+    /// Has the current (innermost) list item received no content yet? True iff the last buffered
+    /// event for the open list is the `ItemStart` marker — used to recognise a *first*-block task
+    /// marker.
+    fn item_is_empty(&mut self) -> bool {
+        matches!(
+            self.innermost_list_mut().and_then(|f| f.events.last()),
+            Some(BufEvent::ItemStart)
+        )
     }
 
     /// Record that a blank line occurred while inside a list. Walking outward from the innermost
@@ -940,11 +984,40 @@ impl StreamParser {
             Leaf::None => {}
             Leaf::Paragraph(text) => {
                 let body = self.consume_refdefs(&text);
+                // The final line's trailing whitespace is not significant (only *interior* line-end
+                // whitespace can form a hard break), so trim the very end before inline parsing.
+                let body = body.trim_end();
                 if body.is_empty() {
                     return;
                 }
+                // GFM task-list item: a list item whose first block is a paragraph beginning with
+                // `[ ]`, `[x]`, or `[X]` (followed by whitespace) renders a checkbox in place of the
+                // marker. Detect it only at the item's first content.
                 let mut inner = Vec::new();
-                inline::parse(&body, &InlineStyle::default(), &self.refs, &mut inner);
+                let mut body = body;
+                if self.gfm && self.para_is_direct_list_child() && self.item_is_empty() {
+                    if let Some((checked, rest)) = task_marker(body) {
+                        inner.push(Event::Text {
+                            text: format!(
+                                "<input {}disabled=\"\" type=\"checkbox\"> ",
+                                if checked { "checked=\"\" " } else { "" }
+                            ),
+                            style: InlineStyle {
+                                raw_html: true,
+                                ..Default::default()
+                            },
+                            span: Span::default(),
+                        });
+                        body = rest;
+                    }
+                }
+                inline::parse(
+                    body,
+                    &InlineStyle::default(),
+                    &self.refs,
+                    self.gfm,
+                    &mut inner,
+                );
                 if self.para_is_direct_list_child() {
                     // A direct child of a list item: buffer as a `Para` run so the list's looseness
                     // can decide on the `<p>` wrapper later (tight → no wrapper).
@@ -993,12 +1066,18 @@ impl StreamParser {
     fn parse_inline(&mut self, text: &str, out: &mut Vec<Event>) {
         if self.in_any_list() {
             let mut inner = Vec::new();
-            inline::parse(text, &InlineStyle::default(), &self.refs, &mut inner);
+            inline::parse(
+                text,
+                &InlineStyle::default(),
+                &self.refs,
+                self.gfm,
+                &mut inner,
+            );
             for ev in inner {
                 self.emit(out, ev);
             }
         } else {
-            inline::parse(text, &InlineStyle::default(), &self.refs, out);
+            inline::parse(text, &InlineStyle::default(), &self.refs, self.gfm, out);
         }
     }
 
@@ -1354,6 +1433,27 @@ fn wrap_item_children(events: Vec<Event>) -> Vec<Event> {
     out
 }
 
+/// A GFM task-list marker at the start of `body`: `[ ]`, `[x]`, or `[X]` followed by a space or tab.
+/// Returns `(checked, rest)` where `rest` is the body after the marker and its single separator
+/// space, or `None` if no marker is present. The bracket content must be exactly one character.
+fn task_marker(body: &str) -> Option<(bool, &str)> {
+    let b = body.as_bytes();
+    if b.first() != Some(&b'[') || b.get(2) != Some(&b']') {
+        return None;
+    }
+    let checked = match b.get(1) {
+        Some(b' ') => false,
+        Some(b'x') | Some(b'X') => true,
+        _ => return None,
+    };
+    // A whitespace separator (or end of line) must follow the closing bracket.
+    match b.get(3) {
+        Some(b' ') | Some(b'\t') => Some((checked, &body[4..])),
+        None => Some((checked, "")),
+        _ => None,
+    }
+}
+
 fn atx_heading(line: &str) -> Option<(u8, &str)> {
     let hashes = line.bytes().take_while(|&b| b == b'#').count();
     if hashes == 0 || hashes > 6 {
@@ -1363,14 +1463,22 @@ fn atx_heading(line: &str) -> Option<(u8, &str)> {
     if !rest.is_empty() && !rest.starts_with([' ', '\t']) {
         return None;
     }
-    let text = rest.trim().trim_end_matches('#');
-    // A closing run of `#` must be preceded by a space (or be the whole tail).
-    let text = if text.len() < rest.trim().len() {
-        text.trim_end()
+    let text = rest.trim();
+    // An optional closing sequence: a run of `#` that is either the whole text or preceded by a space
+    // or tab is stripped (so `# foo #` → `foo`), but a `#` run welded to the preceding word is content
+    // (`# foo#` → `foo#`). The remaining text is inline-parsed, so any escaped `\#` survives as `#`.
+    let trimmed = text.trim_end_matches('#');
+    let text = if trimmed.len() == text.len() {
+        // No trailing `#` run at all.
+        text
+    } else if trimmed.is_empty() || trimmed.ends_with([' ', '\t']) {
+        // The `#` run is the whole text, or is preceded by whitespace → it is a closing sequence.
+        trimmed.trim_end()
     } else {
+        // The `#` run is attached to a word → keep it as content.
         text
     };
-    Some((hashes as u8, text.trim()))
+    Some((hashes as u8, text))
 }
 
 /// A setext underline: a line of only `=` (level 1) or only `-` (level 2), ≤3 leading spaces.
@@ -1406,11 +1514,13 @@ fn fence_start(line: &str) -> Option<(u8, usize, String)> {
     if len < 3 {
         return None;
     }
-    let info = line[len..].trim().to_string();
+    let info = line[len..].trim();
     if ch == b'`' && info.contains('`') {
         return None;
     }
-    Some((ch, len, info))
+    // The info string resolves backslash escapes and entity references to their literal value (it is
+    // ordinary inline text), so e.g. ``` foo\+bar ``` / ``` f&ouml;&ouml; ``` give a clean language.
+    Some((ch, len, linkref::unescape_string(info)))
 }
 
 fn is_closing_fence(line: &str, ch: u8, open_len: usize) -> bool {

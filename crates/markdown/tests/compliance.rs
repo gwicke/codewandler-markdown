@@ -25,12 +25,12 @@ struct Case {
     extension: String,
 }
 
-fn score(corpus_json: &str) -> (usize, usize) {
+fn score(corpus_json: &str, render: fn(&str) -> String) -> (usize, usize) {
     let cases: Vec<Case> = serde_json::from_str(corpus_json).expect("valid corpus JSON");
     let total = cases.len();
     let pass = cases
         .iter()
-        .filter(|c| markdown::html_string(&c.markdown) == c.html)
+        .filter(|c| render(&c.markdown) == c.html)
         .count();
     (pass, total)
 }
@@ -39,12 +39,13 @@ const COMMONMARK: &str = include_str!("../../../corpus/commonmark-0.31.2.json");
 const GFM: &str = include_str!("../../../corpus/gfm-0.29.json");
 
 // Baselines — raised as compliance improves; a drop below these fails the build.
-const WANT_COMMONMARK: usize = 560;
-const WANT_GFM: usize = 548;
+const WANT_COMMONMARK: usize = 592;
+const WANT_GFM: usize = 591;
 
 #[test]
 fn commonmark_compliance() {
-    let (pass, total) = score(COMMONMARK);
+    // CommonMark is scored against the pure-CommonMark renderer (no GFM-only extensions).
+    let (pass, total) = score(COMMONMARK, markdown::html_string);
     println!("CommonMark 0.31.2: {pass}/{total}");
     assert!(
         pass >= WANT_COMMONMARK,
@@ -54,7 +55,8 @@ fn commonmark_compliance() {
 
 #[test]
 fn gfm_compliance() {
-    let (pass, total) = score(GFM);
+    // GFM is scored against the GFM renderer (extended autolinks, task lists, tag filter).
+    let (pass, total) = score(GFM, markdown::html_string_gfm);
     println!("GFM 0.29: {pass}/{total}");
     assert!(
         pass >= WANT_GFM,

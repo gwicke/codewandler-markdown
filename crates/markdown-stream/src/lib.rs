@@ -30,3 +30,12 @@ pub fn parse(input: &str) -> Vec<Event> {
     events.extend(p.flush());
     events
 }
+
+/// Parse a complete document with GFM-only extensions enabled (extended autolinks, task-list items),
+/// in addition to the always-on strikethrough and tables.
+pub fn parse_gfm(input: &str) -> Vec<Event> {
+    let mut p = StreamParser::new_gfm();
+    let mut events = p.write(input.as_bytes());
+    events.extend(p.flush());
+    events
+}
