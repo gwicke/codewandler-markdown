@@ -61,7 +61,11 @@ fn emit(text: &str, style: &InlineStyle, plain: &mut String, out: &mut Vec<Event
                     plain.pop();
                 }
                 flush_plain(plain, style, out);
-                out.push(if hard { Event::LineBreak } else { Event::SoftBreak });
+                out.push(if hard {
+                    Event::LineBreak
+                } else {
+                    Event::SoftBreak
+                });
                 i += 1;
                 // skip leading spaces on the continuation line
                 while i < b.len() && (b[i] == b' ' || b[i] == b'\t') {
@@ -201,10 +205,7 @@ fn find_code_close(b: &[u8], from: usize, n: usize) -> Option<usize> {
 /// CommonMark code-span text: a single leading+trailing space is stripped if the content isn't all
 /// spaces, and interior line breaks collapse to spaces.
 fn code_span_text(s: &str) -> String {
-    let collapsed: String = s
-        .chars()
-        .map(|c| if c == '\n' { ' ' } else { c })
-        .collect();
+    let collapsed: String = s.chars().map(|c| if c == '\n' { ' ' } else { c }).collect();
     if collapsed.len() >= 2
         && collapsed.starts_with(' ')
         && collapsed.ends_with(' ')
@@ -320,10 +321,9 @@ fn try_autolink(text: &str, lt: usize) -> Option<(usize, &str)> {
     let gt = find_byte(b, lt + 1, b'>')?;
     let inner = &text[lt + 1..gt];
     let has_ws = inner.contains(char::is_whitespace);
-    let url_like = (inner.starts_with("http://")
-        || inner.starts_with("https://")
-        || inner.contains("://"))
-        && !has_ws;
+    let url_like =
+        (inner.starts_with("http://") || inner.starts_with("https://") || inner.contains("://"))
+            && !has_ws;
     let email_like = inner.contains('@') && !has_ws && !inner.contains('/');
     if url_like || email_like {
         Some((gt + 1, inner))

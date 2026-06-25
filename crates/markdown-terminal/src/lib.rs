@@ -13,7 +13,9 @@ use markdown_stream::{Alignment, BlockKind, Event, InlineStyle};
 use unicode_width::UnicodeWidthStr;
 
 mod highlight;
+mod live;
 mod theme;
+pub use live::LiveRenderer;
 pub use theme::Theme;
 
 /// Render a complete event stream to an ANSI string using the default theme and width 80.
@@ -25,7 +27,8 @@ pub fn render(events: &[Event]) -> String {
 pub fn render_with(events: &[Event], theme: &Theme, width: usize) -> String {
     let mut r = Renderer::new(theme.clone(), width);
     let mut out = Vec::new();
-    r.feed(events, &mut out).expect("string write is infallible");
+    r.feed(events, &mut out)
+        .expect("string write is infallible");
     r.finish(&mut out).expect("string write is infallible");
     String::from_utf8(out).expect("renderer emits utf-8")
 }
@@ -138,8 +141,12 @@ impl Renderer {
                     BlockKind::FencedCode | BlockKind::IndentedCode => {
                         self.gap(w)?;
                         self.in_code = true;
-                        self.code_lang =
-                            data.info.split_whitespace().next().unwrap_or("").to_string();
+                        self.code_lang = data
+                            .info
+                            .split_whitespace()
+                            .next()
+                            .unwrap_or("")
+                            .to_string();
                     }
                     BlockKind::Table => {
                         self.gap(w)?;
@@ -189,7 +196,14 @@ impl Renderer {
                     BlockKind::ThematicBreak => {
                         self.gap(w)?;
                         let rule = "─".repeat(self.width.min(60));
-                        writeln!(w, "{}{}{}{}", self.indent(), self.theme.muted, rule, self.theme.reset)?;
+                        writeln!(
+                            w,
+                            "{}{}{}{}",
+                            self.indent(),
+                            self.theme.muted,
+                            rule,
+                            self.theme.reset
+                        )?;
                         self.wrote_any = true;
                         self.pending_gap = true;
                     }
@@ -222,12 +236,14 @@ impl Renderer {
             }
             Event::SoftBreak => {
                 if !self.in_code {
-                    self.segments.push((" ".to_string(), InlineStyle::default()));
+                    self.segments
+                        .push((" ".to_string(), InlineStyle::default()));
                 }
             }
             Event::LineBreak => {
                 if !self.in_code {
-                    self.segments.push(("\n".to_string(), InlineStyle::default()));
+                    self.segments
+                        .push(("\n".to_string(), InlineStyle::default()));
                 }
             }
         }

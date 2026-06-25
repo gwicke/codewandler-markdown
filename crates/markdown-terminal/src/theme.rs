@@ -32,10 +32,10 @@ impl Default for Theme {
             italic: "\x1b[3m",
             strike: "\x1b[9m",
             reset: "\x1b[0m",
-            kw: "\x1b[35m",        // magenta
-            str: "\x1b[32m",       // green
-            comment: "\x1b[90m",   // bright black
-            num: "\x1b[33m",       // yellow
+            kw: "\x1b[35m",      // magenta
+            str: "\x1b[32m",     // green
+            comment: "\x1b[90m", // bright black
+            num: "\x1b[33m",     // yellow
         }
     }
 }
