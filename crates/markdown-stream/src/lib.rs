@@ -11,8 +11,10 @@
 #![forbid(unsafe_code)]
 
 mod block;
+mod entity;
 mod event;
 mod inline;
+mod linkref;
 mod parser;
 
 pub use block::StreamParser;

@@ -15,12 +15,18 @@
 //! 3. [`flatten`] — walk the resolved token tree and emit events, stamping each `Text` with the
 //!    cumulative [`InlineStyle`] of the enclosing spans so the flat (terminal) renderer is unchanged.
 
-use crate::event::{Event, Inline, InlineStyle, Link, Span};
+use crate::event::{Event, Inline, InlineStyle, Link, LinkDef, Span};
+use crate::linkref;
+use std::collections::HashMap;
+
+/// A resolved reference map: normalised label → definition. Threaded through scanning so reference
+/// links/images (`[text][label]`, `[label]`, …) can be resolved against the definitions seen so far.
+type Refs = HashMap<String, LinkDef>;
 
 /// Parse the inline content of `text` (already joined with `\n` for multi-line paragraphs) under the
-/// given base `style`, appending events to `out`.
-pub fn parse(text: &str, style: &InlineStyle, out: &mut Vec<Event>) {
-    let mut tokens = scan(text);
+/// given base `style`, resolving reference links against `refs`, appending events to `out`.
+pub fn parse(text: &str, style: &InlineStyle, refs: &Refs, out: &mut Vec<Event>) {
+    let mut tokens = scan(text, refs);
     process_emphasis(&mut tokens, 0);
     flatten(&tokens, style, out);
 }
@@ -81,7 +87,8 @@ struct Delim {
 // ---------------------------------------------------------------------------------------------
 
 /// Scan `text` left to right into a flat token list, resolving every non-emphasis construct.
-fn scan(text: &str) -> Vec<Token> {
+/// `refs` resolves reference links/images encountered along the way.
+fn scan(text: &str, refs: &Refs) -> Vec<Token> {
     let b = text.as_bytes();
     let mut tokens: Vec<Token> = Vec::new();
     let mut buf = String::new();
@@ -138,9 +145,9 @@ fn scan(text: &str) -> Vec<Token> {
                     i += 1;
                 }
             }
-            // Image `![alt](dest)`.
+            // Image `![alt](dest)` / `![alt][ref]` / `![ref]`.
             b'!' if i + 1 < b.len() && b[i + 1] == b'[' => {
-                if let Some((tok, consumed)) = try_link(text, i + 1, true) {
+                if let Some((tok, consumed)) = try_link(text, i + 1, true, refs) {
                     flush!();
                     tokens.push(tok);
                     i += 1 + consumed;
@@ -149,9 +156,9 @@ fn scan(text: &str) -> Vec<Token> {
                     i += 1;
                 }
             }
-            // Link `[text](dest)`.
+            // Link `[text](dest)` / `[text][ref]` / `[ref]`.
             b'[' => {
-                if let Some((tok, consumed)) = try_link(text, i, false) {
+                if let Some((tok, consumed)) = try_link(text, i, false, refs) {
                     flush!();
                     tokens.push(tok);
                     i += consumed;
@@ -591,26 +598,133 @@ fn code_span_text(s: &str) -> String {
     }
 }
 
-/// Try to parse a link `[text](dest "title")` (or image when `image`). `open` indexes the `[`.
-/// Returns the resulting token and the bytes consumed from `open`.
-fn try_link(text: &str, open: usize, image: bool) -> Option<(Token, usize)> {
+/// Try to parse a link or image starting at the `[` indexed by `open` (`image` set for `![…]`).
+/// Returns the resulting token and the bytes consumed from `open`. Handles all four forms:
+///   * inline `[text](dest "title")`,
+///   * full reference `[text][label]`,
+///   * collapsed reference `[label][]`, and
+///   * shortcut reference `[label]`.
+///
+/// Inline syntax takes precedence: a `(` immediately after the `]` is tried as an inline
+/// destination first, and only on failure do we fall back to reference resolution.
+fn try_link(text: &str, open: usize, image: bool, refs: &Refs) -> Option<(Token, usize)> {
     let b = text.as_bytes();
     let close = matching_bracket(b, open)?;
-    if close + 1 >= b.len() || b[close + 1] != b'(' {
+    let label_raw = &text[open + 1..close];
+
+    // Scan the bracketed content once; reused as the link/image inner tokens. A *link* (not an
+    // image) may not contain another link — the inner link binds tighter — so if it does we reject
+    // the outer link and let scanning fall through to the literal `[` and re-match the inner link.
+    let inner = scan_inner(label_raw, refs);
+    let nested_link = contains_link(&inner);
+    let make = |link: Link, end: usize| {
+        if !image && nested_link {
+            None
+        } else {
+            Some((
+                Token::Link {
+                    link,
+                    inner: inner.clone(),
+                },
+                end - open,
+            ))
+        }
+    };
+
+    // 1. Inline `[text](dest "title")` — only when a `(` immediately follows the `]`.
+    if b.get(close + 1) == Some(&b'(') {
+        if let Some((link, end)) = parse_inline_target(text, close + 2, image) {
+            return make(link, end);
+        }
+    }
+
+    // 2. Full reference `[text][label]`.
+    if b.get(close + 1) == Some(&b'[') {
+        if let Some(ref_close) = find_byte(b, close + 2, b']') {
+            let ref_label = &text[close + 2..ref_close];
+            if ref_label.is_empty() {
+                // Collapsed `[label][]`: the text *is* the label.
+                if let Some(link) = resolve_ref(label_raw, image, refs) {
+                    return make(link, ref_close + 1);
+                }
+            } else if let Some(link) = resolve_ref(ref_label, image, refs) {
+                return make(link, ref_close + 1);
+            }
+            // A full/collapsed reference whose label is undefined is not a link.
+            return None;
+        }
+    }
+
+    // 3. Shortcut reference `[label]` — the text itself is the label, and nothing (no `(`/`[`)
+    //    follows. The label may not contain a `]` (guaranteed by `matching_bracket`).
+    if let Some(link) = resolve_ref(label_raw, image, refs) {
+        return make(link, close + 1);
+    }
+
+    None
+}
+
+/// Parse and scan a link/image label's inner content (emphasis resolved).
+fn scan_inner(label: &str, refs: &Refs) -> Vec<Token> {
+    let mut inner = scan(label, refs);
+    process_emphasis(&mut inner, 0);
+    inner
+}
+
+/// Does this token list contain a (non-image) link at any nesting depth? Used to enforce
+/// CommonMark's "a link may not contain another link" rule.
+fn contains_link(tokens: &[Token]) -> bool {
+    tokens.iter().any(|t| match t {
+        Token::Link { link, inner } => !link.image || contains_link(inner),
+        Token::Node { inner, .. } => contains_link(inner),
+        _ => false,
+    })
+}
+
+/// Resolve a reference `label` against `refs`, returning a [`Link`] if defined.
+fn resolve_ref(label: &str, image: bool, refs: &Refs) -> Option<Link> {
+    let norm = linkref::normalize_label(label)?;
+    let def = refs.get(&norm)?;
+    Some(Link {
+        href: def.dest.clone(),
+        title: def.title.clone(),
+        image,
+    })
+}
+
+/// Parse an inline target `dest "title")` whose opening `(` has already been consumed; `start`
+/// indexes the first byte after the `(`. Returns the [`Link`] and the offset just past the `)`.
+fn parse_inline_target(text: &str, start: usize, image: bool) -> Option<(Link, usize)> {
+    let b = text.as_bytes();
+    let mut i = linkref::skip_ws(b, start);
+
+    // Destination (optional → empty href).
+    let (raw_dest, after_dest) = if b.get(i) == Some(&b')') {
+        (String::new(), i)
+    } else {
+        linkref::parse_destination(b, i)?
+    };
+    i = after_dest;
+
+    // Optional title, which must be separated from the destination by whitespace.
+    let ws_end = linkref::skip_ws(b, i);
+    let (raw_title, after_title) = if ws_end > i && b.get(ws_end).is_some_and(|&c| c != b')') {
+        linkref::parse_title(b, ws_end)?
+    } else {
+        (String::new(), i)
+    };
+    i = linkref::skip_ws(b, after_title);
+
+    // A closing `)` must follow.
+    if b.get(i) != Some(&b')') {
         return None;
     }
-    let paren_close = find_byte(b, close + 2, b')')?;
-    let inside = &text[close + 2..paren_close];
-    let (href, title) = split_dest_title(inside);
-    let label = &text[open + 1..close];
-    let mut inner = scan(label);
-    process_emphasis(&mut inner, 0);
     let link = Link {
-        href: href.to_string(),
-        title: title.to_string(),
+        href: linkref::normalize_dest(&raw_dest),
+        title: linkref::normalize_title(&raw_title),
         image,
     };
-    Some((Token::Link { link, inner }, paren_close + 1 - open))
+    Some((link, i + 1))
 }
 
 fn matching_bracket(b: &[u8], open: usize) -> Option<usize> {
@@ -642,17 +756,6 @@ fn matching_bracket(b: &[u8], open: usize) -> Option<usize> {
 
 fn find_byte(b: &[u8], from: usize, target: u8) -> Option<usize> {
     (from..b.len()).find(|&i| b[i] == target)
-}
-
-fn split_dest_title(inside: &str) -> (&str, &str) {
-    let inside = inside.trim();
-    if let Some(q) = inside.find([' ', '\t']) {
-        let dest = &inside[..q];
-        let title = inside[q..].trim().trim_matches(['"', '\'']);
-        (dest, title)
-    } else {
-        (inside, "")
-    }
 }
 
 fn try_autolink(text: &str, lt: usize) -> Option<(usize, &str)> {

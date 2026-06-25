@@ -7,7 +7,9 @@
 
 use crate::event::*;
 use crate::inline;
+use crate::linkref;
 use crate::parser::Parser;
+use std::collections::HashMap;
 
 #[derive(Default)]
 pub struct StreamParser {
@@ -17,6 +19,9 @@ pub struct StreamParser {
     in_quote: bool,
     list: Option<ListState>,
     leaf: Leaf,
+    /// Link reference definitions seen so far, keyed by normalised label. Populated in line order as
+    /// paragraphs are scanned; references resolve against the definitions visible at close time.
+    refs: HashMap<String, LinkDef>,
 }
 
 struct ListState {
@@ -178,7 +183,7 @@ impl StreamParser {
                 data,
                 span: Span::default(),
             });
-            inline::parse(htext, &InlineStyle::default(), out);
+            inline::parse(htext, &InlineStyle::default(), &self.refs, out);
             out.push(Event::exit(BlockKind::Heading));
             return;
         }
@@ -274,11 +279,19 @@ impl StreamParser {
         match std::mem::take(&mut self.leaf) {
             Leaf::None => {}
             Leaf::Paragraph(text) => {
+                // Consume any leading link reference definitions into `self.refs` (no output); only
+                // the remaining lines form the paragraph. Definitions are registered *before* the
+                // paragraph's own inline content is parsed, so a backward reference in trailing text
+                // of the same block resolves.
+                let body = self.consume_refdefs(&text);
+                if body.is_empty() {
+                    return;
+                }
                 let in_tight_item = self.list.as_ref().is_some_and(|l| l.item_open);
                 if !in_tight_item {
                     out.push(Event::enter(BlockKind::Paragraph));
                 }
-                inline::parse(&text, &InlineStyle::default(), out);
+                inline::parse(&body, &InlineStyle::default(), &self.refs, out);
                 if !in_tight_item {
                     out.push(Event::exit(BlockKind::Paragraph));
                 }
@@ -290,6 +303,48 @@ impl StreamParser {
                 out.push(Event::exit(BlockKind::Table));
             }
         }
+    }
+
+    /// Strip leading link reference definitions from a buffered paragraph, registering each into
+    /// `self.refs` (first definition of a label wins). Returns the remaining paragraph text (the
+    /// lines after the last consumed definition), trimmed of the leading newline.
+    ///
+    /// A definition may span multiple buffered lines (the title may sit on a continuation line), so
+    /// this works on the whole buffer rather than line-by-line. Parsing stops at the first position
+    /// that does not begin a valid definition; everything from there on is paragraph text.
+    fn consume_refdefs(&mut self, text: &str) -> String {
+        let b = text.as_bytes();
+        let mut pos = 0;
+        loop {
+            // A definition must start at a block-start position with ≤3 leading spaces.
+            let line_start = pos;
+            let mut p = pos;
+            let mut spaces = 0;
+            while p < b.len() && b[p] == b' ' {
+                spaces += 1;
+                p += 1;
+            }
+            if spaces > 3 {
+                break;
+            }
+            match parse_refdef(b, p) {
+                Some((label, def, next)) => {
+                    if let Some(norm) = linkref::normalize_label(&label) {
+                        self.refs.entry(norm).or_insert(def);
+                        pos = next;
+                    } else {
+                        break;
+                    }
+                }
+                None => {
+                    pos = line_start;
+                    break;
+                }
+            }
+        }
+        // `pos` now sits at a line boundary (each consumed definition ended past its newline), so the
+        // remaining text is exactly the paragraph body.
+        text[pos..].to_string()
     }
 
     fn start_table(&mut self, header: &str, aligns: Vec<Alignment>, out: &mut Vec<Event>) {
@@ -311,7 +366,7 @@ impl StreamParser {
         out.push(Event::enter(BlockKind::TableRow));
         for cell in cells {
             out.push(Event::enter(BlockKind::TableCell));
-            inline::parse(cell.trim(), &InlineStyle::default(), out);
+            inline::parse(cell.trim(), &InlineStyle::default(), &self.refs, out);
             out.push(Event::exit(BlockKind::TableCell));
         }
         out.push(Event::exit(BlockKind::TableRow));
@@ -349,6 +404,160 @@ fn strip_quote(line: &str) -> (bool, String) {
     } else {
         (false, line.to_string())
     }
+}
+
+/// Try to parse a single link reference definition `[label]: dest "title"` starting at byte `i` in
+/// `b`. Returns `(raw_label, definition, next)` where `next` is the offset just past the definition,
+/// or `None` if no valid definition starts here.
+///
+/// The destination may sit on the line after the label, and the title on the line after the
+/// destination; the title is optional and, if a title-like token fails to parse, the definition ends
+/// at the destination (the title line becomes ordinary paragraph text). A definition must be
+/// followed by end-of-input or a line break — trailing non-whitespace on the destination's line
+/// (with no valid title) makes the whole thing not a definition.
+fn parse_refdef(b: &[u8], i: usize) -> Option<(String, LinkDef, usize)> {
+    if b.get(i) != Some(&b'[') {
+        return None;
+    }
+    // Label: up to the matching `]`, honouring backslash escapes; may not contain an unescaped `]`
+    // and may not be empty, and is limited to 999 characters by the spec (corpus stays well under).
+    let mut j = i + 1;
+    let mut label = String::new();
+    loop {
+        match b.get(j) {
+            Some(b'\\') if b.get(j + 1).is_some_and(|c| c.is_ascii_punctuation()) => {
+                label.push('\\');
+                label.push(b[j + 1] as char);
+                j += 2;
+            }
+            Some(b']') => break,
+            Some(b'[') => return None, // an unescaped `[` inside the label is invalid
+            Some(&c) if c < 0x80 => {
+                label.push(c as char);
+                j += 1;
+            }
+            Some(_) => {
+                // Multi-byte UTF-8 char.
+                let s = String::from_utf8_lossy(&b[j..]);
+                let ch = s.chars().next()?;
+                label.push(ch);
+                j += ch.len_utf8();
+            }
+            None => return None,
+        }
+    }
+    // Require `]:`.
+    if b.get(j) != Some(&b']') || b.get(j + 1) != Some(&b':') {
+        return None;
+    }
+    j += 2;
+
+    // Whitespace before the destination, spanning at most one line break.
+    j = skip_inline_ws_to_one_newline(b, j)?;
+
+    // Destination (required).
+    let (raw_dest, after_dest) = linkref::parse_destination(b, j)?;
+    j = after_dest;
+
+    // Whitespace between destination and an optional title. A title is only valid if separated from
+    // the destination by whitespace; if the destination is followed immediately by other content the
+    // definition is invalid.
+    let (title_ws, ws_newlines) = scan_ws(b, j);
+    let after_ws = title_ws;
+
+    // Attempt a title only if whitespace followed the destination and the title sits on this or the
+    // next line (≤1 line break between dest and title).
+    let dest_line_end = line_end(b, j);
+    let mut def_title = String::new();
+    let end;
+
+    if after_ws > j && ws_newlines <= 1 {
+        if let Some((raw_title, after_title)) = linkref::parse_title(b, after_ws) {
+            // After the title only whitespace may remain on the line.
+            let rest = skip_spaces(b, after_title);
+            if rest >= b.len() || b[rest] == b'\n' {
+                def_title = linkref::normalize_title(&raw_title);
+                // Consume the line-ending newline so the next definition starts at a line boundary.
+                end = if rest < b.len() { rest + 1 } else { rest };
+            } else {
+                // A title that is not alone on its line is invalid → the definition stops at the
+                // destination, *iff* the destination itself ends a line cleanly.
+                end = dest_line_end?;
+            }
+        } else {
+            end = dest_line_end?;
+        }
+    } else {
+        // No title: the destination must be alone on its line.
+        end = dest_line_end?;
+    }
+
+    Some((
+        label,
+        LinkDef {
+            dest: linkref::normalize_dest(&raw_dest),
+            title: def_title,
+        },
+        end,
+    ))
+}
+
+/// Skip spaces/tabs and at most one line break, returning the offset, or `None` if a *second* line
+/// break is hit (a blank line ends the definition's whitespace run).
+fn skip_inline_ws_to_one_newline(b: &[u8], mut i: usize) -> Option<usize> {
+    let mut newlines = 0;
+    while i < b.len() {
+        match b[i] {
+            b' ' | b'\t' | b'\r' => i += 1,
+            b'\n' => {
+                newlines += 1;
+                if newlines > 1 {
+                    return None;
+                }
+                i += 1;
+            }
+            _ => break,
+        }
+    }
+    Some(i)
+}
+
+/// Skip spaces/tabs (not newlines) starting at `i`.
+fn skip_spaces(b: &[u8], mut i: usize) -> usize {
+    while i < b.len() && matches!(b[i], b' ' | b'\t' | b'\r') {
+        i += 1;
+    }
+    i
+}
+
+/// Scan whitespace starting at `i`, returning `(end_offset, newline_count)`.
+fn scan_ws(b: &[u8], mut i: usize) -> (usize, usize) {
+    let mut nl = 0;
+    while i < b.len() {
+        match b[i] {
+            b' ' | b'\t' | b'\r' => i += 1,
+            b'\n' => {
+                nl += 1;
+                i += 1;
+            }
+            _ => break,
+        }
+    }
+    (i, nl)
+}
+
+/// The offset just past the end of the current line (after the `\n`) starting from `i`, but only if
+/// everything between `i` and the line end is whitespace. Returns `None` otherwise.
+fn line_end(b: &[u8], i: usize) -> Option<usize> {
+    let mut j = i;
+    while j < b.len() {
+        match b[j] {
+            b' ' | b'\t' | b'\r' => j += 1,
+            b'\n' => return Some(j + 1),
+            _ => return None,
+        }
+    }
+    Some(j)
 }
 
 fn atx_heading(line: &str) -> Option<(u8, &str)> {

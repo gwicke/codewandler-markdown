@@ -39,8 +39,8 @@ const COMMONMARK: &str = include_str!("../../../corpus/commonmark-0.31.2.json");
 const GFM: &str = include_str!("../../../corpus/gfm-0.29.json");
 
 // Baselines — raised as compliance improves; a drop below these fails the build.
-const WANT_COMMONMARK: usize = 322;
-const WANT_GFM: usize = 313;
+const WANT_COMMONMARK: usize = 372;
+const WANT_GFM: usize = 361;
 
 #[test]
 fn commonmark_compliance() {

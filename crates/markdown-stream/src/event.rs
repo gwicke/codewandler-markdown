@@ -62,6 +62,15 @@ pub struct Link {
     pub image: bool,
 }
 
+/// A resolved link reference definition (`[label]: dest "title"`). The destination is already
+/// normalized (escapes/entities resolved, percent-encoded) and the title un-escaped, so resolving a
+/// reference link is just a map lookup. Parser-owned; not part of the public event stream.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LinkDef {
+    pub dest: String,
+    pub title: String,
+}
+
 /// The kind of inline span an `EnterInline`/`ExitInline` event opens or closes.
 ///
 /// Unlike the cumulative [`InlineStyle`] flags carried on `Text` (which a flat renderer reads),
