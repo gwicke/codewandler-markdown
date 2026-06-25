@@ -42,6 +42,22 @@ enum Leaf {
     Table {
         aligns: Vec<Alignment>,
     },
+    /// A raw HTML block (one of the seven CommonMark start conditions). Content is emitted verbatim,
+    /// line by line, until `end` is satisfied.
+    Html {
+        end: HtmlEnd,
+    },
+}
+
+/// The end condition for an open HTML block, per the seven CommonMark start conditions. The string
+/// variants close on the *first line containing* the marker (inclusive); `Blank` closes on the first
+/// blank line (which is not part of the block).
+#[derive(Clone, Copy)]
+enum HtmlEnd {
+    /// Conditions 1–5: close on the first line that contains this (case-insensitive) marker.
+    Marker(&'static str),
+    /// Conditions 6–7: close on the first blank line.
+    Blank,
 }
 
 impl StreamParser {
@@ -125,6 +141,30 @@ impl StreamParser {
             return;
         }
 
+        // Inside an HTML block: emit lines verbatim until the end condition fires. The marker
+        // conditions (1–5) include the closing line in the block; the blank-line conditions (6–7)
+        // close *before* a blank line, which is then handled normally (so it can, e.g., end a list).
+        if let Leaf::Html { end } = self.leaf {
+            match end {
+                HtmlEnd::Marker(marker) => {
+                    out.push(Event::text(format!("{content}\n")));
+                    if contains_ci(&content, marker) {
+                        self.close_leaf(out);
+                    }
+                    return;
+                }
+                HtmlEnd::Blank => {
+                    if content.trim().is_empty() {
+                        self.close_leaf(out);
+                        // Fall through so the blank line ends a lazy blockquote like any other.
+                    } else {
+                        out.push(Event::text(format!("{content}\n")));
+                        return;
+                    }
+                }
+            }
+        }
+
         // Inside a GFM table: a pipe row is a body row; anything else closes the table and is then
         // handled normally.
         if let Leaf::Table { aligns } = &self.leaf {
@@ -150,6 +190,27 @@ impl StreamParser {
         if self.in_quote && !quoted && !matches!(self.leaf, Leaf::Paragraph(_)) {
             self.close_list(out);
             self.close_quote(out);
+        }
+
+        // HTML block start (one of the seven CommonMark conditions). Conditions 1–6 may interrupt an
+        // open paragraph; condition 7 may not (it only starts when no paragraph is open), so we tell
+        // the checker whether a paragraph is currently open. The block's own first line is emitted
+        // verbatim here; subsequent lines flow through the in-HTML branch above.
+        let in_paragraph = matches!(self.leaf, Leaf::Paragraph(_));
+        if let Some(end) = html_block_start(trimmed, in_paragraph) {
+            self.ensure_doc(out);
+            self.close_leaf(out);
+            self.close_list(out);
+            out.push(Event::enter(BlockKind::HtmlBlock));
+            out.push(Event::text(format!("{content}\n")));
+            match end {
+                // A marker condition whose closing marker is already on the start line closes here.
+                HtmlEnd::Marker(marker) if contains_ci(&content, marker) => {
+                    self.close_leaf(out);
+                }
+                _ => self.leaf = Leaf::Html { end },
+            }
+            return;
         }
 
         // Fenced code start.
@@ -301,6 +362,9 @@ impl StreamParser {
             }
             Leaf::Table { .. } => {
                 out.push(Event::exit(BlockKind::Table));
+            }
+            Leaf::Html { .. } => {
+                out.push(Event::exit(BlockKind::HtmlBlock));
             }
         }
     }
@@ -602,6 +666,203 @@ fn fence_start(line: &str) -> Option<(u8, usize, String)> {
 fn is_closing_fence(line: &str, ch: u8, open_len: usize) -> bool {
     let len = line.bytes().take_while(|&c| c == ch).count();
     len >= open_len && line[len..].trim().is_empty()
+}
+
+/// HTML block tag names for start condition 6 (a `<` or `</` followed by one of these, then
+/// whitespace / `>` / `/>` / end of line). Lower-cased; matching is case-insensitive.
+const HTML_BLOCK_TAGS: &[&str] = &[
+    "address",
+    "article",
+    "aside",
+    "base",
+    "basefont",
+    "blockquote",
+    "body",
+    "caption",
+    "center",
+    "col",
+    "colgroup",
+    "dd",
+    "details",
+    "dialog",
+    "dir",
+    "div",
+    "dl",
+    "dt",
+    "fieldset",
+    "figcaption",
+    "figure",
+    "footer",
+    "form",
+    "frame",
+    "frameset",
+    "h1",
+    "h2",
+    "h3",
+    "h4",
+    "h5",
+    "h6",
+    "head",
+    "header",
+    "hr",
+    "html",
+    "iframe",
+    "legend",
+    "li",
+    "link",
+    "main",
+    "menu",
+    "menuitem",
+    "nav",
+    "noframes",
+    "ol",
+    "optgroup",
+    "option",
+    "p",
+    "param",
+    "search",
+    "section",
+    "summary",
+    "table",
+    "tbody",
+    "td",
+    "tfoot",
+    "th",
+    "thead",
+    "title",
+    "tr",
+    "track",
+    "ul",
+];
+
+/// Does `haystack` contain `needle` (ASCII case-insensitive)? Used for the marker-based HTML block
+/// end conditions (`</script>`, `-->`, `?>`, `>`, `]]>`).
+fn contains_ci(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    let h = haystack.as_bytes();
+    let n = needle.as_bytes();
+    if h.len() < n.len() {
+        return false;
+    }
+    (0..=h.len() - n.len()).any(|i| {
+        h[i..i + n.len()]
+            .iter()
+            .zip(n)
+            .all(|(a, b)| a.eq_ignore_ascii_case(b))
+    })
+}
+
+/// Check whether `line` (already stripped of ≤3 leading spaces via `trim_start`) begins an HTML
+/// block. Returns the end condition for the opened block, or `None`. `in_paragraph` indicates an open
+/// paragraph: conditions 1–6 may interrupt it, but condition 7 may not (so it is suppressed then).
+///
+/// Conditions follow the CommonMark spec ordering (1 is tried before 2, …): the first matching start
+/// wins, which matters because, e.g. `<!--` (condition 2) must beat the generic `<!` (condition 4).
+fn html_block_start(line: &str, in_paragraph: bool) -> Option<HtmlEnd> {
+    let b = line.as_bytes();
+    if b.first() != Some(&b'<') {
+        return None;
+    }
+
+    // Condition 1: <script | <pre | <style | <textarea, then whitespace / `>` / EOL.
+    for (tag, close) in [
+        ("script", "</script>"),
+        ("pre", "</pre>"),
+        ("style", "</style>"),
+        ("textarea", "</textarea>"),
+    ] {
+        if starts_tag_ci(line, tag) {
+            let after = &line[1 + tag.len()..];
+            if after.is_empty() || after.starts_with([' ', '\t', '>']) {
+                return Some(HtmlEnd::Marker(close));
+            }
+        }
+    }
+
+    // Condition 2: <!-- … -->.
+    if line.starts_with("<!--") {
+        return Some(HtmlEnd::Marker("-->"));
+    }
+
+    // Condition 3: <? … ?>.
+    if line.starts_with("<?") {
+        return Some(HtmlEnd::Marker("?>"));
+    }
+
+    // Condition 5: <![CDATA[ … ]]>. Checked before condition 4 since both begin `<!`.
+    if line.starts_with("<![CDATA[") {
+        return Some(HtmlEnd::Marker("]]>"));
+    }
+
+    // Condition 4: <! followed by an ASCII letter, ending at the next `>`.
+    if b.get(1) == Some(&b'!') && b.get(2).is_some_and(|c| c.is_ascii_alphabetic()) {
+        return Some(HtmlEnd::Marker(">"));
+    }
+
+    // Condition 6: <tag | </tag for a known block tag, then whitespace / `>` / `/>` / EOL.
+    let (rest, _closing) = match b.get(1) {
+        Some(b'/') => (&line[2..], true),
+        _ => (&line[1..], false),
+    };
+    for tag in HTML_BLOCK_TAGS {
+        if starts_word_ci(rest, tag) {
+            let after = &rest[tag.len()..];
+            if after.is_empty() || after.starts_with([' ', '\t', '>']) || after.starts_with("/>") {
+                return Some(HtmlEnd::Blank);
+            }
+        }
+    }
+
+    // Condition 7: a complete open or closing tag (any name except the condition-1 tags), with only
+    // whitespace after it to end of line. This one may not interrupt a paragraph.
+    if !in_paragraph {
+        if let Some(after) = complete_tag(line) {
+            if after.trim().is_empty() {
+                return Some(HtmlEnd::Blank);
+            }
+        }
+    }
+
+    None
+}
+
+/// Does `line` start with `<tag` (ASCII case-insensitive) for condition 1?
+fn starts_tag_ci(line: &str, tag: &str) -> bool {
+    let b = line.as_bytes();
+    b.first() == Some(&b'<') && starts_word_ci(&line[1..], tag)
+}
+
+/// Does `s` begin with `word` (ASCII case-insensitive)?
+fn starts_word_ci(s: &str, word: &str) -> bool {
+    let b = s.as_bytes();
+    let w = word.as_bytes();
+    b.len() >= w.len()
+        && b[..w.len()]
+            .iter()
+            .zip(w)
+            .all(|(a, c)| a.eq_ignore_ascii_case(c))
+}
+
+/// Parse a complete HTML open or closing tag at the start of `line` for start condition 7, returning
+/// the slice *after* the tag, or `None`. The tag name may be any except script/style/pre/textarea
+/// (those are handled by condition 1). This is the block-level cousin of inline raw HTML and reuses
+/// the same open/close-tag grammar.
+fn complete_tag(line: &str) -> Option<&str> {
+    let b = line.as_bytes();
+    let end = if b.get(1) == Some(&b'/') {
+        crate::inline::scan_closing_tag(b, 0)?
+    } else {
+        let (e, name) = crate::inline::scan_open_tag(b, 0)?;
+        // Condition 1 owns these names.
+        let lname = name.to_ascii_lowercase();
+        if matches!(lname.as_str(), "script" | "style" | "pre" | "textarea") {
+            return None;
+        }
+        e
+    };
+    Some(&line[end..])
 }
 
 /// Parse a list marker. Returns `(ordered, marker_char, start, rest_after_marker)`.

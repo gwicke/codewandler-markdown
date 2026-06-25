@@ -51,6 +51,9 @@ enum Token {
     Link { link: Link, inner: Vec<Token> },
     /// An autolink — rendered as a link whose text equals its destination.
     Autolink { href: String },
+    /// Inline raw HTML (an open/closing tag, comment, PI, declaration, or CDATA): emitted verbatim,
+    /// *unescaped*, by the HTML renderer.
+    RawHtml(String),
     /// A run of emphasis delimiters (`*`/`_`/`~`), still unresolved.
     Delim(Delim),
     /// An emphasis / strong / strikethrough node produced by [`process_emphasis`], wrapping the
@@ -167,13 +170,18 @@ fn scan(text: &str, refs: &Refs) -> Vec<Token> {
                     i += 1;
                 }
             }
-            // Autolink `<scheme:…>` / `<email>`.
+            // Autolink `<scheme:…>` / `<email>`; on failure, inline raw HTML `<tag …>` / `</tag>` /
+            // comment / PI / declaration / CDATA.
             b'<' => {
                 if let Some((end, url)) = try_autolink(text, i) {
                     flush!();
                     tokens.push(Token::Autolink {
                         href: url.to_string(),
                     });
+                    i = end;
+                } else if let Some(end) = try_raw_html(b, i) {
+                    flush!();
+                    tokens.push(Token::RawHtml(text[i..end].to_string()));
                     i = end;
                 } else {
                     buf.push('<');
@@ -461,6 +469,15 @@ fn flatten(tokens: &[Token], base: &InlineStyle, out: &mut Vec<Event>) {
                 });
                 flatten(inner, &st, out);
                 out.push(Event::ExitInline { inline });
+            }
+            Token::RawHtml(s) => {
+                let mut st = base.clone();
+                st.raw_html = true;
+                out.push(Event::Text {
+                    text: s.clone(),
+                    style: st,
+                    span: Span::default(),
+                });
             }
             Token::Autolink { href } => {
                 let mut st = base.clone();
@@ -756,6 +773,252 @@ fn matching_bracket(b: &[u8], open: usize) -> Option<usize> {
 
 fn find_byte(b: &[u8], from: usize, target: u8) -> Option<usize> {
     (from..b.len()).find(|&i| b[i] == target)
+}
+
+/// Try to match inline raw HTML starting at the `<` indexed by `lt`, returning the offset just past
+/// the match. Tries, in CommonMark's order: open tag, closing tag, HTML comment, processing
+/// instruction, declaration, and CDATA. The matched bytes are emitted verbatim (unescaped).
+fn try_raw_html(b: &[u8], lt: usize) -> Option<usize> {
+    if b.get(lt) != Some(&b'<') {
+        return None;
+    }
+    if b.get(lt + 1) == Some(&b'/') {
+        return scan_closing_tag(b, lt);
+    }
+    if let Some((end, _)) = scan_open_tag(b, lt) {
+        return Some(end);
+    }
+    // The declaration-family constructs all begin `<!` or `<?`.
+    match b.get(lt + 1) {
+        Some(b'!') => scan_comment(b, lt)
+            .or_else(|| scan_cdata(b, lt))
+            .or_else(|| scan_declaration(b, lt)),
+        Some(b'?') => scan_processing_instruction(b, lt),
+        _ => None,
+    }
+}
+
+/// Scan an HTML open tag `<name (attr)* /?>` starting at the `<` indexed by `lt`. Returns the offset
+/// just past the `>` and the (raw) tag name. Shared with block start condition 7.
+pub(crate) fn scan_open_tag(b: &[u8], lt: usize) -> Option<(usize, String)> {
+    if b.get(lt) != Some(&b'<') {
+        return None;
+    }
+    let mut i = lt + 1;
+    // Tag name: ASCII letter, then letters/digits/`-`.
+    let name_start = i;
+    if !b.get(i).is_some_and(|c| c.is_ascii_alphabetic()) {
+        return None;
+    }
+    i += 1;
+    while b
+        .get(i)
+        .is_some_and(|&c| c.is_ascii_alphanumeric() || c == b'-')
+    {
+        i += 1;
+    }
+    let name = String::from_utf8_lossy(&b[name_start..i]).into_owned();
+
+    // Zero or more attributes, each introduced by whitespace.
+    loop {
+        let ws_end = skip_html_ws(b, i);
+        // An attribute must be preceded by whitespace; stop if none was consumed.
+        if let Some(next) = scan_attribute(b, ws_end) {
+            if ws_end == i {
+                // No whitespace before the attribute → invalid (unless we're at the tag end).
+                break;
+            }
+            i = next;
+        } else {
+            i = ws_end;
+            break;
+        }
+    }
+
+    let i = skip_html_ws(b, i);
+    // Optional self-closing slash, then the required `>`.
+    let i = if b.get(i) == Some(&b'/') { i + 1 } else { i };
+    if b.get(i) == Some(&b'>') {
+        Some((i + 1, name))
+    } else {
+        None
+    }
+}
+
+/// Scan an HTML closing tag `</name>` starting at the `<` indexed by `lt`. Returns the offset just
+/// past the `>`. Shared with block start condition 7.
+pub(crate) fn scan_closing_tag(b: &[u8], lt: usize) -> Option<usize> {
+    if b.get(lt) != Some(&b'<') || b.get(lt + 1) != Some(&b'/') {
+        return None;
+    }
+    let mut i = lt + 2;
+    if !b.get(i).is_some_and(|c| c.is_ascii_alphabetic()) {
+        return None;
+    }
+    i += 1;
+    while b
+        .get(i)
+        .is_some_and(|&c| c.is_ascii_alphanumeric() || c == b'-')
+    {
+        i += 1;
+    }
+    let i = skip_html_ws(b, i);
+    if b.get(i) == Some(&b'>') {
+        Some(i + 1)
+    } else {
+        None
+    }
+}
+
+/// Scan one HTML attribute starting at `i` (the position after the introducing whitespace): a name
+/// `[A-Za-z_:][A-Za-z0-9_.:-]*`, optionally followed by `= value`. Returns the offset just past it.
+fn scan_attribute(b: &[u8], i: usize) -> Option<usize> {
+    // Attribute name.
+    if !b
+        .get(i)
+        .is_some_and(|&c| c.is_ascii_alphabetic() || c == b'_' || c == b':')
+    {
+        return None;
+    }
+    let mut j = i + 1;
+    while b
+        .get(j)
+        .is_some_and(|&c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'.' | b':' | b'-'))
+    {
+        j += 1;
+    }
+    // Optional `= value`.
+    let eq = skip_html_ws(b, j);
+    if b.get(eq) != Some(&b'=') {
+        return Some(j);
+    }
+    let val = skip_html_ws(b, eq + 1);
+    let after = scan_attr_value(b, val)?;
+    Some(after)
+}
+
+/// Scan an attribute value at `i`: double-quoted, single-quoted, or unquoted. Returns the offset
+/// just past it.
+fn scan_attr_value(b: &[u8], i: usize) -> Option<usize> {
+    match b.get(i) {
+        Some(&q @ (b'"' | b'\'')) => {
+            let mut j = i + 1;
+            while let Some(&c) = b.get(j) {
+                if c == q {
+                    return Some(j + 1);
+                }
+                j += 1;
+            }
+            None
+        }
+        Some(_) => {
+            // Unquoted: one or more chars that are not whitespace or one of `"'=<>` and backtick.
+            let mut j = i;
+            while b.get(j).is_some_and(|&c| {
+                !matches!(
+                    c,
+                    b' ' | b'\t' | b'\r' | b'\n' | b'"' | b'\'' | b'=' | b'<' | b'>' | b'`'
+                )
+            }) {
+                j += 1;
+            }
+            if j > i {
+                Some(j)
+            } else {
+                None
+            }
+        }
+        None => None,
+    }
+}
+
+/// Scan an HTML comment starting at the `<` indexed by `lt`: `<!-->`, `<!--->`, or `<!--` text `-->`
+/// where text does not start with `>` or `->`, and does not end with `-`. Returns the offset past it.
+fn scan_comment(b: &[u8], lt: usize) -> Option<usize> {
+    if !b[lt..].starts_with(b"<!--") {
+        return None;
+    }
+    let body = lt + 4;
+    // Special-cased empty comments.
+    if b[body..].starts_with(b">") {
+        return Some(body + 1); // <!-->
+    }
+    if b[body..].starts_with(b"->") {
+        return Some(body + 2); // <!--->
+    }
+    // Find the first `-->`; the text in between must not end with `-`.
+    let mut i = body;
+    while i + 3 <= b.len() {
+        if &b[i..i + 3] == b"-->" {
+            // Text is b[body..i]; it must not end with `-` (i.e. avoid `--->` collapsing the close).
+            if i > body && b[i - 1] == b'-' {
+                return None;
+            }
+            return Some(i + 3);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Scan an HTML processing instruction `<? … ?>` starting at the `<` indexed by `lt`.
+fn scan_processing_instruction(b: &[u8], lt: usize) -> Option<usize> {
+    if !b[lt..].starts_with(b"<?") {
+        return None;
+    }
+    let mut i = lt + 2;
+    while i + 2 <= b.len() {
+        if &b[i..i + 2] == b"?>" {
+            return Some(i + 2);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Scan an HTML declaration `<!NAME … >` starting at the `<` indexed by `lt`: `<!` then one or more
+/// ASCII letters, then any chars, then `>`.
+fn scan_declaration(b: &[u8], lt: usize) -> Option<usize> {
+    if !b[lt..].starts_with(b"<!") {
+        return None;
+    }
+    let mut i = lt + 2;
+    if !b.get(i).is_some_and(|c| c.is_ascii_alphabetic()) {
+        return None;
+    }
+    while b.get(i).is_some_and(|c| c.is_ascii_alphabetic()) {
+        i += 1;
+    }
+    while let Some(&c) = b.get(i) {
+        if c == b'>' {
+            return Some(i + 1);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Scan a CDATA section `<![CDATA[ … ]]>` starting at the `<` indexed by `lt`.
+fn scan_cdata(b: &[u8], lt: usize) -> Option<usize> {
+    if !b[lt..].starts_with(b"<![CDATA[") {
+        return None;
+    }
+    let mut i = lt + 9;
+    while i + 3 <= b.len() {
+        if &b[i..i + 3] == b"]]>" {
+            return Some(i + 3);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Skip HTML whitespace (space, tab, CR, LF) starting at `i`.
+fn skip_html_ws(b: &[u8], mut i: usize) -> usize {
+    while matches!(b.get(i), Some(b' ' | b'\t' | b'\r' | b'\n')) {
+        i += 1;
+    }
+    i
 }
 
 fn try_autolink(text: &str, lt: usize) -> Option<(usize, &str)> {

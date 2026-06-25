@@ -26,6 +26,9 @@ pub fn render_into(out: &mut String, events: &[Event]) {
     let mut list_stack: Vec<bool> = Vec::new();
     // `image_stack`: one frame per in-progress image, buffering the plain-text `alt` for `![…](…)`.
     let mut image_stack: Vec<ImageFrame> = Vec::new();
+    // Inside a raw HTML block, `Text` is emitted verbatim (no escaping) — the block's lines *are*
+    // the output.
+    let mut in_html = false;
 
     for ev in events {
         // While inside an image, suppress all tag output and accumulate inner text into `alt`.
@@ -101,7 +104,7 @@ pub fn render_into(out: &mut String, events: &[Event]) {
                 BlockKind::IndentedCode => {
                     out.push_str("<pre><code>");
                 }
-                BlockKind::HtmlBlock => {}
+                BlockKind::HtmlBlock => in_html = true,
                 BlockKind::Table | BlockKind::TableRow | BlockKind::TableCell => {}
             },
             Event::ExitBlock { block, .. } => match block {
@@ -121,13 +124,20 @@ pub fn render_into(out: &mut String, events: &[Event]) {
                 BlockKind::FencedCode | BlockKind::IndentedCode => {
                     out.push_str("</code></pre>\n");
                 }
+                BlockKind::HtmlBlock => in_html = false,
                 _ => {}
             },
-            Event::Text { text, .. } => {
-                // Every `Text` escapes raw: regular text, block-level code (fenced/indented), and
-                // the text inside an inline `Code` span all want HTML-escaped output with no inner
-                // markup, and emphasis/links arrive as their own enter/exit events.
-                out.push_str(&escape(text));
+            Event::Text { text, style, .. } => {
+                // Inside an HTML block, and for inline raw HTML (`style.raw_html`), the text is
+                // verbatim HTML and is emitted unescaped. Everything else escapes raw: regular text,
+                // block-level code (fenced/indented), and the text inside an inline `Code` span all
+                // want HTML-escaped output with no inner markup, and emphasis/links arrive as their
+                // own enter/exit events.
+                if in_html || style.raw_html {
+                    out.push_str(text);
+                } else {
+                    out.push_str(&escape(text));
+                }
             }
             Event::EnterInline { inline, .. } => match inline {
                 Inline::Emphasis => out.push_str("<em>"),

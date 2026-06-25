@@ -95,12 +95,21 @@ pub struct InlineStyle {
     pub code: bool,     // inline code span
     pub strikethrough: bool,
     pub link: Option<Link>,
+    /// `true` for inline raw HTML (`<tag …>`, comments, …): the text is verbatim HTML and an HTML
+    /// renderer must emit it *unescaped*. The terminal renderer ignores this flag (the literal tag
+    /// text is shown as-is), so it has no effect on terminal output.
+    pub raw_html: bool,
 }
 
 impl InlineStyle {
     /// `true` when no styling applies (plain text).
     pub fn is_plain(&self) -> bool {
-        !self.emphasis && !self.strong && !self.code && !self.strikethrough && self.link.is_none()
+        !self.emphasis
+            && !self.strong
+            && !self.code
+            && !self.strikethrough
+            && self.link.is_none()
+            && !self.raw_html
     }
 }
 

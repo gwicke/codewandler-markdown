@@ -21,6 +21,12 @@ fn split_equivalence_on_samples() {
         "```\ncode\n```\n",
         "text with `code` and **bold**\n",
         "1. first\n2. second\n",
+        // HTML block (condition 6, blank-line terminated) followed by a paragraph.
+        "<div>\nraw *html*\n</div>\n\nafter\n",
+        // HTML block (condition 1, marker-terminated by `</pre>`) with an interior blank line.
+        "<pre>\nx\n\ny\n</pre>\nokay\n",
+        // Inline raw HTML inside a paragraph.
+        "a <span class=\"x\"> b </span> c\n",
     ];
     for s in samples {
         let whole = parse(s);
