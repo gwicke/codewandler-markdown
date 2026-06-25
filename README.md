@@ -30,14 +30,29 @@ whole document.
 | `markdown-terminal` | events → styled terminal output (ANSI) + the live renderer |
 | `markdown` | the top-level facade (`render_string`, `html_string`, `parse`) |
 
-## Roadmap
+## Status
 
-- **M0** — workspace + parser contract + vendored corpora + compliance/split harness ✅
-- **M1** — CommonMark block parser + minimal HTML
-- **M2** — CommonMark inlines → 100% (652/652)
-- **M3** — GFM (tables, strikethrough, task lists, autolinks)
-- **M4** — terminal renderer (themes, wrapping, highlight, live tables)
-- **M5+** — CLI viewer, ratatui viewport, benchmarks
+The streaming parser, the live terminal renderer, and the `mdview` CLI are working end to end:
+
+- **Parser** — streaming blocks (headings, fenced code, blockquotes, bullet/ordered lists, thematic
+  breaks, GFM tables) + inlines (emphasis, strong, code spans, links, images, strikethrough,
+  autolinks, escapes, hard/soft breaks); chunk-safe (**split-equivalent**). CommonMark **219/652**,
+  GFM 222/672 and climbing.
+- **Terminal renderer** — themed ANSI, width-aware word wrapping, indented lists/blockquotes, GFM
+  tables with per-column alignment + box-drawing borders, and dependency-free syntax highlighting for
+  fenced code. TTY / `NO_COLOR` aware (plain when piped).
+- **`mdview`** — `mdview FILE` or `… | mdview`: render Markdown to the terminal, streaming.
+
+```sh
+printf '# Hi\n\n- **bold** item\n\n```rust\nfn main() {}\n```\n' | cargo run -q -p mdview
+```
+
+### Next
+
+- Full CommonMark/GFM compliance (the corpora ratchet upward), nested lists, setext headings,
+  reference links, indented code.
+- HTML table rendering; the live in-place redraw of streaming tables; a ratatui viewport; criterion
+  benchmarks vs `pulldown-cmark`/`comrak`/`termimad`.
 
 ## License
 
