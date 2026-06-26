@@ -41,7 +41,7 @@ pub struct Renderer {
     theme: Theme,
     width: usize,
     /// nesting prefixes (one per open blockquote / list level)
-    prefixes: Vec<String>,
+    prefixes: Vec<Prefix>,
     list_stack: Vec<ListCtx>,
     /// accumulated styled segments for the current paragraph/heading
     segments: Vec<(String, InlineStyle)>,
@@ -57,6 +57,38 @@ pub struct Renderer {
 struct ListCtx {
     ordered: bool,
     next: u64,
+}
+
+/// A nesting prefix. `first` is printed on the first line the level appears on (a list marker like
+/// `1. `); `cont` is printed on every continuation/wrapped line — for a list marker that's blanks of
+/// equal width so wrapped text aligns under the item, while a blockquote keeps its `│ ` bar on both.
+struct Prefix {
+    first: String,
+    cont: String,
+    /// set once `first` has been emitted; thereafter every line (even a leading one) uses `cont`,
+    /// so a second paragraph or a nested list inside one item doesn't re-print the marker.
+    emitted: bool,
+}
+
+impl Prefix {
+    /// A prefix that repeats identically on every line (a blockquote bar).
+    fn repeating(s: String) -> Self {
+        Prefix {
+            cont: s.clone(),
+            first: s,
+            emitted: false,
+        }
+    }
+
+    /// A hanging list marker: `marker` on the first line, blanks of the same visible width after.
+    fn marker(marker: String) -> Self {
+        let cont = " ".repeat(visible_width(&marker));
+        Prefix {
+            first: marker,
+            cont,
+            emitted: false,
+        }
+    }
 }
 
 /// Buffers a table's rendered cells until it closes, so column widths can be computed.
@@ -98,8 +130,26 @@ impl Renderer {
         Ok(())
     }
 
+    /// Indent for continuation/wrapped lines: every level's continuation form (list markers become
+    /// blanks, blockquote bars stay).
     fn indent(&self) -> String {
-        self.prefixes.concat()
+        self.prefixes.iter().map(|p| p.cont.as_str()).collect()
+    }
+
+    /// Indent for the first physical line of a block: emit each level's marker the first time the
+    /// level appears, then fall back to its continuation form. This is what keeps a list marker on
+    /// the item's first line only, rather than repeating it down every wrapped line.
+    fn indent_first(&mut self) -> String {
+        let mut s = String::new();
+        for p in &mut self.prefixes {
+            if p.emitted {
+                s.push_str(&p.cont);
+            } else {
+                s.push_str(&p.first);
+                p.emitted = true;
+            }
+        }
+        s
     }
 
     fn gap<W: Write>(&mut self, w: &mut W) -> io::Result<()> {
@@ -117,8 +167,10 @@ impl Renderer {
                     BlockKind::Document => {}
                     BlockKind::BlockQuote => {
                         self.gap(w)?;
-                        self.prefixes
-                            .push(format!("{}│ {}", self.theme.muted, self.theme.reset));
+                        self.prefixes.push(Prefix::repeating(format!(
+                            "{}│ {}",
+                            self.theme.muted, self.theme.reset
+                        )));
                     }
                     BlockKind::List => {
                         self.gap(w)?;
@@ -136,7 +188,7 @@ impl Renderer {
                             }
                             _ => "• ".to_string(),
                         };
-                        self.prefixes.push(marker);
+                        self.prefixes.push(Prefix::marker(marker));
                     }
                     BlockKind::FencedCode | BlockKind::IndentedCode => {
                         self.gap(w)?;
@@ -342,20 +394,29 @@ impl Renderer {
         }
         self.gap(w)?;
         let segments = std::mem::take(&mut self.segments);
-        let indent = self.indent();
-        let avail = self.width.saturating_sub(visible_width(&indent)).max(20);
+        // `cont` indents wrapped/continuation lines (list markers become blanks); `first` carries
+        // the marker and is consumed by `indent_first`, so it appears on the opening line only.
+        let cont = self.indent();
+        let avail = self.width.saturating_sub(visible_width(&cont)).max(20);
+        let first = self.indent_first();
 
         let mut line_vis = 0usize;
         let mut pending_space = false;
-        write!(w, "{indent}")?;
+        let mut started = false;
+        write!(w, "{first}")?;
 
         for (raw, style) in &segments {
             for atom in atoms(raw) {
                 match atom {
                     Atom::Space => pending_space = true,
                     Atom::Hard => {
+                        // Drop a hard break before any word: loose list items emit a phantom "\n"
+                        // ahead of their paragraph, which would otherwise print a bare-marker line.
+                        if !started {
+                            continue;
+                        }
                         writeln!(w)?;
-                        write!(w, "{indent}")?;
+                        write!(w, "{cont}")?;
                         line_vis = 0;
                         pending_space = false;
                     }
@@ -365,7 +426,7 @@ impl Renderer {
                         if line_vis > 0 && line_vis + sep + wv > avail {
                             // wrap to a fresh line (the pending space is dropped at the break)
                             writeln!(w)?;
-                            write!(w, "{indent}")?;
+                            write!(w, "{cont}")?;
                             line_vis = 0;
                         } else if sep == 1 {
                             write!(w, " ")?;
@@ -374,6 +435,7 @@ impl Renderer {
                         write!(w, "{}", self.styled(word, style, block_style))?;
                         line_vis += wv;
                         pending_space = false;
+                        started = true;
                     }
                 }
             }
@@ -469,4 +531,54 @@ fn visible_width(s: &str) -> usize {
         }
     }
     w
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{render_with, Theme};
+    use markdown_stream::parse;
+
+    fn render(src: &str, width: usize) -> String {
+        render_with(&parse(src), &Theme::no_color(), width)
+    }
+
+    #[test]
+    fn wrapped_list_item_shows_marker_once_then_aligns() {
+        // A single bullet long enough to wrap several times.
+        let out = render("- alpha beta gamma delta epsilon zeta eta theta iota\n", 24);
+        let lines: Vec<&str> = out.lines().filter(|l| !l.is_empty()).collect();
+        assert!(lines.len() > 1, "input should wrap across lines: {out:?}");
+        assert!(
+            lines[0].starts_with("• "),
+            "marker on first line: {:?}",
+            lines[0]
+        );
+        for l in &lines[1..] {
+            assert!(
+                !l.starts_with("• "),
+                "marker must not repeat on a wrapped line: {l:?}"
+            );
+            assert!(
+                l.starts_with("  ") && !l.trim_start().is_empty(),
+                "continuation should be space-aligned under the marker: {l:?}"
+            );
+        }
+        // exactly one marker for the whole item
+        assert_eq!(out.matches("• ").count(), 1, "bullet count: {out:?}");
+    }
+
+    #[test]
+    fn loose_list_item_has_no_bare_marker_line() {
+        // Blank lines between items make the list "loose"; the parser emits a leading "\n" per
+        // item, which previously rendered as a bare "1." line before the content.
+        let src = "1. first item that is quite long and certainly wraps\n\n\
+                   2. second item that is also long enough to wrap as well\n";
+        let out = render(src, 24);
+        for l in out.lines() {
+            let t = l.trim_end();
+            assert!(t != "1." && t != "2.", "bare marker line in:\n{out}");
+        }
+        assert_eq!(out.matches("1. ").count(), 1, "one '1. ' marker: {out:?}");
+        assert_eq!(out.matches("2. ").count(), 1, "one '2. ' marker: {out:?}");
+    }
 }
