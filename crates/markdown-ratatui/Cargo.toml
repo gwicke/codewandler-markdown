@@ -1,0 +1,13 @@
+[package]
+name = "markdown-ratatui"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Render a markdown-stream event stream to ratatui Text (styled, width-aware, no ANSI round-trip)"
+
+[dependencies]
+markdown-stream.workspace = true
+unicode-width.workspace = true
+ratatui = { version = "0.29", default-features = false }

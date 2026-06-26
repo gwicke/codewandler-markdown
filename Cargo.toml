@@ -4,13 +4,14 @@ members = [
     "crates/markdown-stream",
     "crates/markdown-html",
     "crates/markdown-terminal",
+    "crates/markdown-ratatui",
     "crates/markdown",
     "crates/mdview",
 ]
 
 [workspace.package]
 edition = "2021"
-version = "0.1.1"
+version = "0.1.2"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/codewandler/markdown"
 homepage = "https://github.com/codewandler/markdown"
@@ -21,6 +22,7 @@ rust-version = "1.85"
 markdown-stream = { path = "crates/markdown-stream" }
 markdown-html = { path = "crates/markdown-html" }
 markdown-terminal = { path = "crates/markdown-terminal" }
+markdown-ratatui = { path = "crates/markdown-ratatui" }
 # external
 unicode-width = "0.2"
 is-terminal = "0.4"
