@@ -45,3 +45,26 @@ cargo fmt --all --check
 
 Narrowly-scoped changes; don't revert others' work; ASCII by default. Mirror the Go original's behavior
 when in doubt — it's cloned read-only alongside as the reference.
+
+## Releasing
+
+Releases are CI-driven — never `cargo publish` locally.
+
+1. Bump `[workspace.package] version` **and** the `version =` fields on the internal deps in the root
+   `Cargo.toml` (the release gate fails if the tag and workspace version disagree).
+2. Run the green gate; commit `Release X.Y.Z` (title + bullet body).
+3. `git tag -a vX.Y.Z -m "Release X.Y.Z"`, then push `main` + the tag.
+4. The `release` workflow (`.github/workflows/release.yml`) does the rest: gate →
+   `cargo publish --workspace` → GitHub release with generated notes. The crates.io token is the
+   org-level Actions secret `CARGO_REGISTRY_TOKEN` (org secrets don't show in `gh secret list -R`).
+
+Publishing facts:
+
+- Library crates publish under the `codewandler-` prefix (`markdown` is taken on crates.io);
+  `[lib] name` keeps the short imports (`use markdown::…`, `use markdown_stream::…`), so renames
+  never touch source.
+- `mdview` is `publish = false` — that name is taken on crates.io too.
+- `Cargo.lock` is gitignored (intentional): dependency upgrades surface only as manifest
+  requirement changes.
+- v0.2.0 was tagged but never published (local token lacked the `publish-new` scope); the crates.io
+  history starts at 0.2.1.
