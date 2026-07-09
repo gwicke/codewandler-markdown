@@ -23,12 +23,21 @@ whole document.
 
 ## Workspace
 
-| Crate | What |
-|---|---|
-| `markdown-stream` | the incremental parser + event model (pure `std`) |
-| `markdown-html` | events → HTML (the compliance oracle) |
-| `markdown-terminal` | events → styled terminal output (ANSI) + the live renderer |
-| `markdown` | the top-level facade (`render_string`, `html_string`, `parse`) |
+Published on crates.io under the `codewandler-` prefix; the import names stay short
+(`use markdown::…`, `use markdown_stream::…`).
+
+| Crate | crates.io | What |
+|---|---|---|
+| `markdown-stream` | `codewandler-markdown-stream` | the incremental parser + event model (pure `std`) |
+| `markdown-html` | `codewandler-markdown-html` | events → HTML (the compliance oracle) |
+| `markdown-terminal` | `codewandler-markdown-terminal` | events → styled terminal output (ANSI) + the live renderer |
+| `markdown-ratatui` | `codewandler-markdown-ratatui` | events → `ratatui` `Text` for TUIs |
+| `markdown` | `codewandler-markdown` | the top-level facade (`render_string`, `html_string`, `parse`) |
+| `mdview` | — | the CLI (workspace-only; the name is taken on crates.io) |
+
+```sh
+cargo add codewandler-markdown   # imported in code as `markdown`
+```
 
 ## Status
 

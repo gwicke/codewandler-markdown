@@ -1,11 +1,14 @@
 [package]
-name = "markdown-stream"
+name = "codewandler-markdown-stream"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 description = "Incremental, chunk-safe CommonMark/GFM parser emitting a flat event stream (pure std)"
+
+[lib]
+name = "markdown_stream"
 
 # The parser is pure std — no runtime dependencies (mirrors the Go original).
 [dependencies]

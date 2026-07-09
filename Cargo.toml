@@ -11,18 +11,19 @@ members = [
 
 [workspace.package]
 edition = "2021"
-version = "0.1.2"
+version = "0.2.0"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/codewandler/markdown"
 homepage = "https://github.com/codewandler/markdown"
-rust-version = "1.85"
+rust-version = "1.88"
 
 [workspace.dependencies]
-# internal
-markdown-stream = { path = "crates/markdown-stream" }
-markdown-html = { path = "crates/markdown-html" }
-markdown-terminal = { path = "crates/markdown-terminal" }
-markdown-ratatui = { path = "crates/markdown-ratatui" }
+# internal — published under the codewandler- prefix ("markdown" is taken on crates.io);
+# the dep key keeps the short name so `use markdown_stream::…` etc. stay unchanged
+markdown-stream = { path = "crates/markdown-stream", package = "codewandler-markdown-stream", version = "0.2.0" }
+markdown-html = { path = "crates/markdown-html", package = "codewandler-markdown-html", version = "0.2.0" }
+markdown-terminal = { path = "crates/markdown-terminal", package = "codewandler-markdown-terminal", version = "0.2.0" }
+markdown-ratatui = { path = "crates/markdown-ratatui", package = "codewandler-markdown-ratatui", version = "0.2.0" }
 # external
 unicode-width = "0.2"
 is-terminal = "0.4"

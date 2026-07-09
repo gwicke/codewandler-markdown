@@ -6,6 +6,8 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 description = "Render Markdown to the terminal (streaming) — the CLI front-end for the markdown library"
+# "mdview" is taken on crates.io; the CLI stays a workspace-local tool for now.
+publish = false
 
 [[bin]]
 name = "mdview"
