@@ -465,8 +465,28 @@ impl Renderer {
         if style.link.is_some() {
             codes.push_str(self.theme.link);
         }
-        if codes.is_empty() {
+        // OSC 8 hyperlink wrapper (clickable in supporting terminals). Off by
+        // default and enabled via `Theme::clickable_links`. Images are skipped
+        // — OSC 8 links target text, not image content — and an empty target is
+        // never wrapped.
+        let osc_open = if self.theme.clickable_links {
+            style
+                .link
+                .as_ref()
+                .filter(|l| !l.image && !l.href.is_empty())
+                .map(|l| format!("\x1b]8;;{}\x1b\\", l.href))
+        } else {
+            None
+        };
+        let osc_close = "\x1b]8;;\x1b\\";
+        if codes.is_empty() && osc_open.is_none() {
             text.to_string()
+        } else if let Some(open) = osc_open {
+            if codes.is_empty() {
+                format!("{open}{text}{osc_close}")
+            } else {
+                format!("{open}{codes}{text}{}{osc_close}", self.theme.reset)
+            }
         } else {
             format!("{codes}{text}{}", self.theme.reset)
         }
@@ -540,6 +560,44 @@ mod tests {
 
     fn render(src: &str, width: usize) -> String {
         render_with(&parse(src), &Theme::no_color(), width)
+    }
+
+    #[test]
+    fn link_is_clickable_when_theme_enables_it() {
+        let mut theme = Theme::default();
+        theme.clickable_links = true;
+        let out = render_with(&parse("[text](https://example.com/a)"), &theme, 80);
+        assert!(
+            out.contains("\x1b]8;;https://example.com/a\x1b\\"),
+            "OSC 8 open sequence must wrap the href"
+        );
+        assert!(
+            out.contains("\x1b]8;;\x1b\\"),
+            "OSC 8 close sequence must be emitted"
+        );
+        assert!(out.contains("text"), "link text must still be rendered");
+    }
+
+    #[test]
+    fn link_is_not_clickable_by_default() {
+        // Default theme leaves clickable_links disabled.
+        let out = render_with(&parse("[text](https://example.com/a)"), &Theme::default(), 80);
+        assert!(
+            !out.contains("\x1b]8;;"),
+            "default theme must not emit OSC 8 hyperlink sequences"
+        );
+    }
+
+    #[test]
+    fn image_alt_text_is_not_wrapped_as_link() {
+        // Images (`![alt](src)`) must not be wrapped in an OSC 8 hyperlink.
+        let mut theme = Theme::default();
+        theme.clickable_links = true;
+        let out = render_with(&parse("![alt](https://example.com/i.png)"), &theme, 80);
+        assert!(
+            !out.contains("\x1b]8;;"),
+            "image alt text must not be wrapped as a clickable link"
+        );
     }
 
     #[test]

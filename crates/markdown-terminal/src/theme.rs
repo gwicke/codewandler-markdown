@@ -18,6 +18,12 @@ pub struct Theme {
     pub str: &'static str,
     pub comment: &'static str,
     pub num: &'static str,
+    /// When `true`, inline links are wrapped in OSC 8 hyperlink sequences
+    /// (`\x1b]8;;<href>\x1b\\ ... \x1b]8;;\x1b\\`) so they are clickable in
+    /// terminals that support it (iTerm2, GNOME Terminal, VS Code, Alacritty,
+    /// WezTerm, Kitty, …). Off by default — callers opt in (e.g. only on a real
+    /// TTY) so logs and pipes stay free of escape noise.
+    pub clickable_links: bool,
 }
 
 impl Default for Theme {
@@ -36,6 +42,7 @@ impl Default for Theme {
             str: "\x1b[32m",     // green
             comment: "\x1b[90m", // bright black
             num: "\x1b[33m",     // yellow
+            clickable_links: false,
         }
     }
 }
@@ -56,6 +63,7 @@ impl Theme {
             str: "",
             comment: "",
             num: "",
+            clickable_links: false,
         }
     }
 
