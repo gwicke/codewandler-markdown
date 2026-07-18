@@ -639,4 +639,17 @@ mod tests {
         assert_eq!(out.matches("1. ").count(), 1, "one '1. ' marker: {out:?}");
         assert_eq!(out.matches("2. ").count(), 1, "one '2. ' marker: {out:?}");
     }
+
+    #[test]
+    fn dimmed_theme_reapplies_faint_after_inline_style() {
+        // Inline formatting must not clear the dimming: `Theme::dimmed`'s
+        // `reset` re-applies `\x1b[2m` so faded content (e.g. streamed
+        // thinking) stays dimmed through bold/code spans.
+        let out = render_with(&parse("**bold** and `code`"), &Theme::dimmed(), 80);
+        assert!(
+            out.contains("\x1b[0m\x1b[2m"),
+            "reset must re-apply faint (\\x1b[2m), not a bare \\x1b[0m: {out:?}"
+        );
+        assert!(out.contains("\x1b[2m"), "output must contain the faint attribute");
+    }
 }

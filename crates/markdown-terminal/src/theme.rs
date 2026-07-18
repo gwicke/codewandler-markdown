@@ -48,6 +48,29 @@ impl Default for Theme {
 }
 
 impl Theme {
+    /// A theme for secondary/faded content (e.g. streamed "thinking" /
+    /// reasoning): styled spans are faded, and — crucially — `reset` re-applies
+    /// the faint attribute (`\x1b[2m`) instead of a bare `\x1b[0m`, so inline
+    /// formatting does not wipe the dimming. Callers still emit an initial
+    /// `\x1b[2m` for plain (unstyled) text.
+    pub fn dimmed() -> Self {
+        Theme {
+            heading: "\x1b[1;36m",
+            code: "\x1b[38;5;180m",
+            link: "\x1b[4;34m",
+            muted: "\x1b[2m",
+            bold: "\x1b[1m",
+            italic: "\x1b[3m",
+            strike: "\x1b[9m",
+            reset: "\x1b[0m\x1b[2m",
+            kw: "\x1b[35m",
+            str: "\x1b[32m",
+            comment: "\x1b[90m",
+            num: "\x1b[33m",
+            clickable_links: false,
+        }
+    }
+
     /// A theme that emits no escape sequences (for non-TTY / `--no-color`).
     pub fn no_color() -> Self {
         Theme {
