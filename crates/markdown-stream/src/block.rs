@@ -44,6 +44,7 @@ pub struct StreamParser {
     /// autolinks and task-list-item markers. (Strikethrough and tables are always on.) The flag is
     /// off by default so the plain [`StreamParser::new`] path stays CommonMark-faithful.
     gfm: bool,
+    disable_forward_refs: bool,
     /// The forward-reference output gate. Finalised top-level output is staged here as [`Slot`]s
     /// (resolved events plus deferred inline runs) so a block holding an as-yet-undefined reference —
     /// and every event after it — can be held until the reference resolves or `flush()` is reached,
@@ -190,6 +191,14 @@ impl StreamParser {
     pub fn new_gfm() -> Self {
         StreamParser {
             gfm: true,
+            ..Self::default()
+        }
+    }
+
+    pub fn new_gfm_no_forward_refs() -> Self {
+        StreamParser {
+            gfm: true,
+            disable_forward_refs: true,
             ..Self::default()
         }
     }
@@ -826,6 +835,8 @@ impl StreamParser {
     fn emit(&mut self, out: &mut Vec<Event>, ev: Event) {
         if let Some(frame) = self.innermost_list_mut() {
             frame.events.push(BufEvent::Raw(ev));
+        } else if self.disable_forward_refs {
+            out.push(ev);
         } else {
             self.gate.push(Slot::Event(ev));
             self.drain_gate(out);
@@ -837,6 +848,10 @@ impl StreamParser {
     fn emit_para(&mut self, out: &mut Vec<Event>, para: Vec<Event>) {
         if let Some(frame) = self.innermost_list_mut() {
             frame.events.push(BufEvent::Para(para));
+        } else if self.disable_forward_refs {
+            out.push(Event::enter(BlockKind::Paragraph));
+            out.extend(para);
+            out.push(Event::exit(BlockKind::Paragraph));
         } else {
             // Not in a list: paragraphs are always wrapped.
             self.gate
@@ -1171,19 +1186,27 @@ impl StreamParser {
                 let style = InlineStyle::default();
                 let mut inner = Vec::new();
                 let mut labels = Vec::new();
-                inline::parse_collect_unresolved(
-                    body,
-                    &style,
-                    &self.refs,
-                    self.gfm,
-                    &mut inner,
-                    &mut labels,
-                );
-                let deferred = (!labels.is_empty()).then(|| Deferred {
-                    text: body.to_string(),
-                    style,
-                    labels,
-                });
+                if !self.disable_forward_refs {
+                    inline::parse_collect_unresolved(
+                        body,
+                        &style,
+                        &self.refs,
+                        self.gfm,
+                        &mut inner,
+                        &mut labels,
+                    );
+                } else {
+                    inline::parse(body, &style, &self.refs, self.gfm, &mut inner);
+                }
+                let deferred = if self.disable_forward_refs {
+                    None
+                } else {
+                    (!labels.is_empty()).then(|| Deferred {
+                        text: body.to_string(),
+                        style,
+                        labels,
+                    })
+                };
 
                 if self.para_is_direct_list_child() {
                     // A direct child of a list item: buffer so the list's looseness can decide on the
