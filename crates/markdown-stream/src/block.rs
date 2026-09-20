@@ -244,6 +244,43 @@ impl Parser for StreamParser {
         out
     }
 
+    /// Process any **complete lines** currently in the buffer (up to the last `\n`),
+    /// emitting any blocks that close naturally (paragraphs ended by blank line,
+    /// headings, fences, etc.), **without** processing the final partial line.
+    /// Safe to call mid-stream; preserves split-equivalence.
+    fn flush_completed(&mut self) -> Vec<Event> {
+        let mut out = Vec::new();
+        if self.buf.is_empty() {
+            return out;
+        }
+        // Find the last complete line (ending with `\n`)
+        let Some(last_nl) = self.buf.iter().rposition(|&b| b == b'\n') else {
+            return out; // no complete lines
+        };
+        // Drain up to and including that newline
+        let complete: Vec<u8> = self.buf.drain(..=last_nl).collect();
+        // Process the complete lines one by one, exactly like write() does.
+        // This preserves split-equivalence and correctly handles blank lines,
+        // headings, fences, etc. that close on a single line.
+        let mut start = 0;
+        while let Some(nl_pos) = complete[start..].iter().position(|&b| b == b'\n') {
+            let nl_pos = start + nl_pos;
+            let mut line_bytes = &complete[start..nl_pos];
+            // Strip trailing \r from CRLF
+            if line_bytes.last() == Some(&b'\r') {
+                line_bytes = &line_bytes[..line_bytes.len() - 1];
+            }
+            let line = String::from_utf8_lossy(line_bytes).into_owned();
+            self.process_line(&line, &mut out);
+            start = nl_pos + 1;
+        }
+        // Note: we do NOT close the leaf or containers here — those stay open
+        // for the next chunk. Only naturally-closed blocks (paragraphs, headings,
+        // etc.) are emitted.
+        self.drain_gate(&mut out);
+        out
+    }
+
     fn reset(&mut self) {
         *self = Self::default();
     }

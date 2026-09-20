@@ -581,7 +581,11 @@ mod tests {
     #[test]
     fn link_is_not_clickable_by_default() {
         // Default theme leaves clickable_links disabled.
-        let out = render_with(&parse("[text](https://example.com/a)"), &Theme::default(), 80);
+        let out = render_with(
+            &parse("[text](https://example.com/a)"),
+            &Theme::default(),
+            80,
+        );
         assert!(
             !out.contains("\x1b]8;;"),
             "default theme must not emit OSC 8 hyperlink sequences"
@@ -650,6 +654,9 @@ mod tests {
             out.contains("\x1b[0m\x1b[2m"),
             "reset must re-apply faint (\\x1b[2m), not a bare \\x1b[0m: {out:?}"
         );
-        assert!(out.contains("\x1b[2m"), "output must contain the faint attribute");
+        assert!(
+            out.contains("\x1b[2m"),
+            "output must contain the faint attribute"
+        );
     }
 }
