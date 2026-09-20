@@ -45,6 +45,10 @@ pub struct StreamParser {
     /// off by default so the plain [`StreamParser::new`] path stays CommonMark-faithful.
     gfm: bool,
     disable_forward_refs: bool,
+    /// When true, all lists (including nested) are assumed to be tight — no blank-line tracking,
+    /// no `<p>` wrappers for item paragraphs, and list events stream incrementally as items close.
+    /// If the input actually contains loose lists, output will be spec-incorrect (missing `<p>`).
+    assume_tight_lists: bool,
     /// The forward-reference output gate. Finalised top-level output is staged here as [`Slot`]s
     /// (resolved events plus deferred inline runs) so a block holding an as-yet-undefined reference —
     /// and every event after it — can be held until the reference resolves or `flush()` is reached,
@@ -199,6 +203,24 @@ impl StreamParser {
         StreamParser {
             gfm: true,
             disable_forward_refs: true,
+            ..Self::default()
+        }
+    }
+
+    /// Like [`new_gfm_no_forward_refs`] but with `assume_tight_lists` enabled.
+    pub fn new_gfm_tight_lists() -> Self {
+        StreamParser {
+            gfm: true,
+            disable_forward_refs: true,
+            assume_tight_lists: true,
+            ..Self::default()
+        }
+    }
+
+    /// A CommonMark parser with `assume_tight_lists` enabled.
+    pub fn new_tight_lists() -> Self {
+        StreamParser {
+            assume_tight_lists: true,
             ..Self::default()
         }
     }
@@ -605,12 +627,16 @@ impl StreamParser {
 
         if same_list {
             // Continuing the same list: a blank line before this sibling item makes the list loose.
-            self.commit_pending_blank();
+            if !self.assume_tight_lists {
+                self.commit_pending_blank();
+            }
         } else {
             // Starting a fresh list. If it is nested directly inside a list item, it is a second
             // block of that item, so a blank line preceding it makes the *enclosing* list loose
             // (e.g. `1.  foo\n\n    - bar`).
-            if matches!(self.containers.last(), Some(Container::Item { .. })) {
+            if !self.assume_tight_lists
+                && matches!(self.containers.last(), Some(Container::Item { .. }))
+            {
                 self.commit_pending_blank();
             }
             let frame = ListFrame {
@@ -622,6 +648,27 @@ impl StreamParser {
                 pending_blank: false,
             };
             self.containers.push(Container::List(frame));
+
+            // In tight-lists mode, emit the list start immediately
+            if self.assume_tight_lists {
+                let data = BlockData {
+                    list: Some(ListData {
+                        ordered: m.ordered,
+                        start: m.start,
+                        tight: true,
+                        marker: m.marker,
+                    }),
+                    ..Default::default()
+                };
+                self.emit(
+                    out,
+                    Event::EnterBlock {
+                        block: BlockKind::List,
+                        data,
+                        span: Span::default(),
+                    },
+                );
+            }
         }
 
         self.emit(out, Event::enter(BlockKind::ListItem));
@@ -870,8 +917,19 @@ impl StreamParser {
     /// Emit an event, routing it into the innermost open list's buffer if one is open, else staging
     /// it on the forward-reference gate. `out` is drained from the gate once per write/flush.
     fn emit(&mut self, out: &mut Vec<Event>, ev: Event) {
+        let tight_mode = self.assume_tight_lists;
         if let Some(frame) = self.innermost_list_mut() {
-            frame.events.push(BufEvent::Raw(ev));
+            if tight_mode {
+                // In tight-lists mode, emit directly instead of buffering
+                if self.disable_forward_refs {
+                    out.push(ev);
+                } else {
+                    self.gate.push(Slot::Event(ev));
+                    self.drain_gate(out);
+                }
+            } else {
+                frame.events.push(BufEvent::Raw(ev));
+            }
         } else if self.disable_forward_refs {
             out.push(ev);
         } else {
@@ -883,8 +941,16 @@ impl StreamParser {
     /// Emit a buffered run of paragraph inline content (so the `<p>` wrapper can be toggled by
     /// looseness at close time).
     fn emit_para(&mut self, out: &mut Vec<Event>, para: Vec<Event>) {
+        let tight_mode = self.assume_tight_lists;
         if let Some(frame) = self.innermost_list_mut() {
-            frame.events.push(BufEvent::Para(para));
+            if tight_mode {
+                // In tight-lists mode, emit directly without <p> wrapper
+                for ev in para {
+                    self.emit(out, ev);
+                }
+            } else {
+                frame.events.push(BufEvent::Para(para));
+            }
         } else if self.disable_forward_refs {
             out.push(Event::enter(BlockKind::Paragraph));
             out.extend(para);
@@ -905,8 +971,20 @@ impl StreamParser {
     /// Buffer a deferred list-item paragraph run (a direct child of a list item) so its `<p>` wrapper
     /// can be toggled by looseness at list close, like [`BufEvent::Para`]. Only called while a list
     /// is open.
-    fn emit_buf_para_defer(&mut self, prefix: Vec<Event>, deferred: Deferred) {
-        if let Some(frame) = self.innermost_list_mut() {
+    fn emit_buf_para_defer(
+        &mut self,
+        out: &mut Vec<Event>,
+        prefix: Vec<Event>,
+        deferred: Deferred,
+    ) {
+        if self.assume_tight_lists {
+            // In tight-lists mode, emit directly without <p> wrapper
+            for ev in prefix {
+                self.emit(out, ev);
+            }
+            self.gate.push(Slot::Deferred(deferred));
+            self.drain_gate(out);
+        } else if let Some(frame) = self.innermost_list_mut() {
             frame.events.push(BufEvent::DeferPara { prefix, deferred });
         }
     }
@@ -914,8 +992,12 @@ impl StreamParser {
     /// Buffer a deferred inline run that is already positioned between explicit `<p>` events (a
     /// paragraph nested under another block inside a list item): replayed verbatim, no re-wrapping.
     /// Only called while a list is open.
-    fn emit_buf_raw_defer(&mut self, deferred: Deferred) {
-        if let Some(frame) = self.innermost_list_mut() {
+    fn emit_buf_raw_defer(&mut self, out: &mut Vec<Event>, deferred: Deferred) {
+        if self.assume_tight_lists {
+            // In tight-lists mode, emit directly
+            self.gate.push(Slot::Deferred(deferred));
+            self.drain_gate(out);
+        } else if let Some(frame) = self.innermost_list_mut() {
             frame.events.push(BufEvent::DeferRaw(deferred));
         }
     }
@@ -986,6 +1068,12 @@ impl StreamParser {
     }
 
     fn mark_item_end(&mut self) {
+        if self.assume_tight_lists {
+            // In tight-lists mode, emit the item end immediately
+            // The list was already emitted at start, so just close the item
+            // Nothing special needed here since item events are emitted directly
+            return;
+        }
         if let Some(frame) = self.innermost_list_mut() {
             frame.events.push(BufEvent::ItemEnd);
         }
@@ -1007,6 +1095,9 @@ impl StreamParser {
     /// the quote loose (the quote "absorbs" the blank). If a later block lands in one of the marked
     /// lists, that list is loose.
     fn note_blank_in_item(&mut self) {
+        if self.assume_tight_lists {
+            return; // Skip blank tracking in tight-lists mode
+        }
         for c in self.containers.iter_mut().rev() {
             match c {
                 Container::List(l) => l.pending_blank = true,
@@ -1022,6 +1113,9 @@ impl StreamParser {
     /// enclosing list loose (the enclosing list is only loose if a blank directly precedes one of its
     /// own added blocks).
     fn commit_pending_blank(&mut self) {
+        if self.assume_tight_lists {
+            return; // Skip blank tracking in tight-lists mode
+        }
         let mut committed = false;
         for c in self.containers.iter_mut().rev() {
             if let Container::List(l) = c {
@@ -1075,7 +1169,13 @@ impl StreamParser {
                     self.emit(out, Event::exit(BlockKind::ListItem));
                 }
                 Container::List(frame) => {
-                    self.flush_list(frame, out);
+                    if self.assume_tight_lists {
+                        // In tight-lists mode, the list was already emitted at start
+                        // Just emit the exit
+                        self.emit(out, Event::exit(BlockKind::List));
+                    } else {
+                        self.flush_list(frame, out);
+                    }
                 }
             }
         }
@@ -1249,7 +1349,7 @@ impl StreamParser {
                     // A direct child of a list item: buffer so the list's looseness can decide on the
                     // `<p>` wrapper later (tight → no wrapper).
                     match deferred {
-                        Some(deferred) => self.emit_buf_para_defer(prefix, deferred),
+                        Some(deferred) => self.emit_buf_para_defer(out, prefix, deferred),
                         None => {
                             let mut run = prefix;
                             run.extend(inner);
@@ -1264,7 +1364,7 @@ impl StreamParser {
                         self.emit(out, ev);
                     }
                     match deferred {
-                        Some(deferred) => self.emit_buf_raw_defer(deferred),
+                        Some(deferred) => self.emit_buf_raw_defer(out, deferred),
                         None => {
                             for ev in inner {
                                 self.emit(out, ev);
@@ -1333,7 +1433,7 @@ impl StreamParser {
         });
         if self.in_any_list() {
             match deferred {
-                Some(deferred) => self.emit_buf_raw_defer(deferred),
+                Some(deferred) => self.emit_buf_raw_defer(out, deferred),
                 None => {
                     for ev in inner {
                         self.emit(out, ev);
