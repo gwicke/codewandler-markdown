@@ -207,8 +207,10 @@ impl StreamParser {
         }
     }
 
-    /// Like [`new_gfm_no_forward_refs`] but with `assume_tight_lists` enabled.
-    pub fn new_gfm_tight_lists() -> Self {
+    /// GFM parser optimized for streaming LLM output: no forward-reference buffering
+    /// and incremental tight-list rendering. This is the recommended constructor for
+    /// live LLM token streams.
+    pub fn new_gfm_stream() -> Self {
         StreamParser {
             gfm: true,
             disable_forward_refs: true,

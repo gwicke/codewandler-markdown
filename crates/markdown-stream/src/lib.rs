@@ -40,10 +40,11 @@ pub fn parse_gfm(input: &str) -> Vec<Event> {
     events
 }
 
-/// Parse a complete document with GFM-only extensions and `assume_tight_lists` enabled.
-/// Lists are emitted incrementally as items close, without `<p>` wrappers.
-pub fn parse_gfm_tight_lists(input: &str) -> Vec<Event> {
-    let mut p = StreamParser::new_gfm_tight_lists();
+/// Parse a complete document with GFM streaming optimizations:
+/// no forward-reference buffering and incremental tight-list rendering.
+/// Recommended for live LLM token streams.
+pub fn parse_gfm_stream(input: &str) -> Vec<Event> {
+    let mut p = StreamParser::new_gfm_stream();
     let mut events = p.write(input.as_bytes());
     events.extend(p.flush());
     events
