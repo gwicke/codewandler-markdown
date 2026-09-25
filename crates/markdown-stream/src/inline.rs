@@ -26,9 +26,10 @@ type Refs = HashMap<String, LinkDef>;
 
 /// Parse the inline content of `text` (already joined with `\n` for multi-line paragraphs) under the
 /// given base `style`, resolving reference links against `refs`, appending events to `out`. `gfm`
-/// enables the GFM extended (bare) autolink syntax.
-pub fn parse(text: &str, style: &InlineStyle, refs: &Refs, gfm: bool, out: &mut Vec<Event>) {
-    let mut tokens = scan(text, refs, gfm, &mut None);
+/// enables the GFM extended (bare) autolink syntax. `disable_strikethrough` treats `~` as a literal
+/// character (never a strikethrough delimiter).
+pub fn parse(text: &str, style: &InlineStyle, refs: &Refs, gfm: bool, disable_strikethrough: bool, out: &mut Vec<Event>) {
+    let mut tokens = scan(text, refs, gfm, disable_strikethrough, &mut None);
     process_emphasis(&mut tokens, 0);
     flatten(&tokens, style, out);
 }
@@ -44,11 +45,12 @@ pub fn parse_collect_unresolved(
     style: &InlineStyle,
     refs: &Refs,
     gfm: bool,
+    disable_strikethrough: bool,
     out: &mut Vec<Event>,
     unresolved: &mut Vec<String>,
 ) {
     let mut sink = Some(std::mem::take(unresolved));
-    let mut tokens = scan(text, refs, gfm, &mut sink);
+    let mut tokens = scan(text, refs, gfm, disable_strikethrough, &mut sink);
     process_emphasis(&mut tokens, 0);
     flatten(&tokens, style, out);
     *unresolved = sink.unwrap_or_default();
@@ -116,9 +118,10 @@ struct Delim {
 
 /// Scan `text` left to right into a flat token list, resolving every non-emphasis construct.
 /// `refs` resolves reference links/images encountered along the way; `gfm` enables the extended
-/// (bare) autolink syntax. When `unresolved` is `Some`, the normalised labels of reference
-/// links/images whose label is undefined are recorded into it (for forward-reference detection).
-fn scan(text: &str, refs: &Refs, gfm: bool, unresolved: &mut Option<Vec<String>>) -> Vec<Token> {
+/// (bare) autolink syntax. `disable_strikethrough` treats `~` as a literal character. When
+/// `unresolved` is `Some`, the normalised labels of reference links/images whose label is
+/// undefined are recorded into it (for forward-reference detection).
+fn scan(text: &str, refs: &Refs, gfm: bool, disable_strikethrough: bool, unresolved: &mut Option<Vec<String>>) -> Vec<Token> {
     let b = text.as_bytes();
     let mut tokens: Vec<Token> = Vec::new();
     let mut buf = String::new();
@@ -247,12 +250,22 @@ fn scan(text: &str, refs: &Refs, gfm: bool, unresolved: &mut Option<Vec<String>>
             b'*' | b'_' | b'~' => {
                 let n = run_len(b, i, c);
                 // GFM: only runs of 1 or 2 tildes are strikethrough delimiters; 3+ are literal.
-                if c == b'~' && n >= 3 {
-                    for _ in 0..n {
-                        buf.push('~');
+                // If strikethrough is disabled, all tilde runs are literal.
+                if c == b'~' {
+                    if disable_strikethrough {
+                        for _ in 0..n {
+                            buf.push('~');
+                        }
+                        i += n;
+                        continue;
                     }
-                    i += n;
-                    continue;
+                    if n >= 3 {
+                        for _ in 0..n {
+                            buf.push('~');
+                        }
+                        i += n;
+                        continue;
+                    }
                 }
                 let before = char_before(text, i);
                 let after = char_after(text, i + n);
@@ -762,7 +775,7 @@ fn scan_inner(
     gfm: bool,
     unresolved: &mut Option<Vec<String>>,
 ) -> Vec<Token> {
-    let mut inner = scan(label, refs, gfm, unresolved);
+    let mut inner = scan(label, refs, gfm, false, unresolved);
     process_emphasis(&mut inner, 0);
     inner
 }

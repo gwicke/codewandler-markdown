@@ -49,6 +49,10 @@ pub struct StreamParser {
     /// no `<p>` wrappers for item paragraphs, and list events stream incrementally as items close.
     /// If the input actually contains loose lists, output will be spec-incorrect (missing `<p>`).
     assume_tight_lists: bool,
+    /// When true, the `~` (tilde) character is treated as a literal character and never parsed as a
+    /// strikethrough delimiter. Useful for LLM output that may contain unescaped tildes in file paths
+    /// or other content that should not render as struck-through text.
+    disable_strikethrough: bool,
     /// The forward-reference output gate. Finalised top-level output is staged here as [`Slot`]s
     /// (resolved events plus deferred inline runs) so a block holding an as-yet-undefined reference —
     /// and every event after it — can be held until the reference resolves or `flush()` is reached,
@@ -209,12 +213,14 @@ impl StreamParser {
 
     /// GFM parser optimized for streaming LLM output: no forward-reference buffering
     /// and incremental tight-list rendering. This is the recommended constructor for
-    /// live LLM token streams.
+    /// live LLM token streams. Also disables strikethrough parsing (`~` treated as
+    /// literal) to avoid unintended rendering of tildes in file paths or other content.
     pub fn new_gfm_stream() -> Self {
         StreamParser {
             gfm: true,
             disable_forward_refs: true,
             assume_tight_lists: true,
+            disable_strikethrough: true,
             ..Self::default()
         }
     }
@@ -1057,7 +1063,7 @@ impl StreamParser {
             match slot {
                 Slot::Event(ev) => out.push(ev),
                 Slot::Deferred(d) => {
-                    inline::parse(&d.text, &d.style, &self.refs, self.gfm, out);
+                    inline::parse(&d.text, &d.style, &self.refs, self.gfm, self.disable_strikethrough, out);
                 }
             }
         }
@@ -1331,11 +1337,12 @@ impl StreamParser {
                         &style,
                         &self.refs,
                         self.gfm,
+                        self.disable_strikethrough,
                         &mut inner,
                         &mut labels,
                     );
                 } else {
-                    inline::parse(body, &style, &self.refs, self.gfm, &mut inner);
+                    inline::parse(body, &style, &self.refs, self.gfm, self.disable_strikethrough, &mut inner);
                 }
                 let deferred = if self.disable_forward_refs {
                     None
@@ -1425,6 +1432,7 @@ impl StreamParser {
             &style,
             &self.refs,
             self.gfm,
+            self.disable_strikethrough,
             &mut inner,
             &mut labels,
         );
