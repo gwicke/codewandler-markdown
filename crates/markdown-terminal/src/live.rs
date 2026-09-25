@@ -21,6 +21,16 @@ pub struct LiveRenderer {
 }
 
 impl LiveRenderer {
+    /// Get the current wrap width.
+    pub fn width(&self) -> usize {
+        self.width
+    }
+
+    /// Update the wrap width. Takes effect on the next `push` call.
+    pub fn set_width(&mut self, width: usize) {
+        self.width = width.max(20);
+    }
+
     /// Create a live renderer. `live` should be true when the output is an interactive terminal
     /// (enables the in-place cursor redraw); false accumulates and renders once at `finish`.
     pub fn new(theme: Theme, width: usize, live: bool) -> Self {

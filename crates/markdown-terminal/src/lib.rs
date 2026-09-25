@@ -54,6 +54,18 @@ pub struct Renderer {
     wrote_any: bool,
 }
 
+impl Renderer {
+    /// Get the current wrap width.
+    pub fn width(&self) -> usize {
+        self.width
+    }
+
+    /// Update the wrap width. Takes effect on the next `feed` call.
+    pub fn set_width(&mut self, width: usize) {
+        self.width = width.max(20);
+    }
+}
+
 struct ListCtx {
     ordered: bool,
     next: u64,
