@@ -172,6 +172,23 @@ impl Renderer {
         Ok(())
     }
 
+    /// Remove trailing whitespace (spaces, tabs, newlines) from accumulated segments.
+    /// Used when a nested list interrupts a paragraph to avoid rendering an extra
+    /// continuation line for the trailing newline.
+    fn trim_trailing_whitespace(&mut self) {
+        while let Some((text, _)) = self.segments.last_mut() {
+            let trimmed = text.trim_end_matches(|c: char| c.is_whitespace());
+            if trimmed.len() == text.len() {
+                break;
+            }
+            if trimmed.is_empty() {
+                self.segments.pop();
+            } else {
+                *text = trimmed.to_string();
+            }
+        }
+    }
+
     fn event<W: Write>(&mut self, ev: &Event, w: &mut W) -> io::Result<()> {
         match ev {
             Event::EnterBlock { block, data, .. } => {
@@ -185,6 +202,20 @@ impl Renderer {
                         )));
                     }
                     BlockKind::List => {
+                        // Flush any pending inline content from a parent list item's paragraph
+                        // before starting a nested list. The parser buffers paragraph events for
+                        // direct list-item children until the list closes, but nested lists are
+                        // emitted immediately, so we must flush proactively.
+                        if !self.segments.is_empty() {
+                            // The parser may include a trailing newline in the paragraph text when
+                            // a nested list interrupts it. Trim trailing whitespace to avoid
+                            // rendering an extra continuation line.
+                            self.trim_trailing_whitespace();
+                            self.flush_segments(w, None)?;
+                            // flush_segments sets pending_gap = true for the next block, but a
+                            // nested list is a child block, not a sibling — suppress the extra gap.
+                            self.pending_gap = false;
+                        }
                         self.gap(w)?;
                         self.list_stack.push(ListCtx {
                             ordered: data.list.as_ref().is_some_and(|l| l.ordered),
@@ -192,6 +223,11 @@ impl Renderer {
                         });
                     }
                     BlockKind::ListItem => {
+                        // Flush any pending inline content from the previous block in this list item
+                        // (or a parent list item) before starting a new item.
+                        if !self.segments.is_empty() {
+                            self.flush_segments(w, None)?;
+                        }
                         let marker = match self.list_stack.last_mut() {
                             Some(l) if l.ordered => {
                                 let n = l.next;
@@ -576,8 +612,10 @@ mod tests {
 
     #[test]
     fn link_is_clickable_when_theme_enables_it() {
-        let mut theme = Theme::default();
-        theme.clickable_links = true;
+        let theme = Theme {
+            clickable_links: true,
+            ..Theme::default()
+        };
         let out = render_with(&parse("[text](https://example.com/a)"), &theme, 80);
         assert!(
             out.contains("\x1b]8;;https://example.com/a\x1b\\"),
@@ -607,8 +645,10 @@ mod tests {
     #[test]
     fn image_alt_text_is_not_wrapped_as_link() {
         // Images (`![alt](src)`) must not be wrapped in an OSC 8 hyperlink.
-        let mut theme = Theme::default();
-        theme.clickable_links = true;
+        let theme = Theme {
+            clickable_links: true,
+            ..Theme::default()
+        };
         let out = render_with(&parse("![alt](https://example.com/i.png)"), &theme, 80);
         assert!(
             !out.contains("\x1b]8;;"),
@@ -669,6 +709,199 @@ mod tests {
         assert!(
             out.contains("\x1b[2m"),
             "output must contain the faint attribute"
+        );
+    }
+
+    #[test]
+    fn nested_list_renders_correctly() {
+        // Simple nested list: parent item with text, then nested list
+        let input = "- top list\n  - nested item 1\n  - nested item 2\n";
+        let out = render_with(&parse(input), &Theme::no_color(), 80);
+        println!("Nested list output:\n{}", out);
+
+        let lines: Vec<&str> = out.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(lines.len(), 3, "should have 3 lines: {:?}", lines);
+
+        // First line: parent item marker + text
+        assert!(
+            lines[0].starts_with("• "),
+            "line 1 should start with bullet: {:?}",
+            lines[0]
+        );
+        assert!(
+            !lines[0].starts_with("• •"),
+            "line 1 should not have double bullet: {:?}",
+            lines[0]
+        );
+
+        // Second line: nested item (indented + bullet)
+        assert!(
+            lines[1].starts_with("  • "),
+            "line 2 should start with two spaces + bullet: {:?}",
+            lines[1]
+        );
+        assert!(
+            !lines[1].starts_with("• •"),
+            "line 2 should not have double bullet: {:?}",
+            lines[1]
+        );
+
+        // Third line: nested item (indented + bullet)
+        assert!(
+            lines[2].starts_with("  • "),
+            "line 3 should start with two spaces + bullet: {:?}",
+            lines[2]
+        );
+        assert!(
+            !lines[2].starts_with("• •"),
+            "line 3 should not have double bullet: {:?}",
+            lines[2]
+        );
+    }
+
+    #[test]
+    fn three_level_nested_list() {
+        // Three-level nested list from split_equivalence test
+        let input = "- foo\n  - bar\n    - baz\n";
+        let out = render_with(&parse(input), &Theme::no_color(), 80);
+        println!("Three-level nested list output:\n{}", out);
+
+        let lines: Vec<&str> = out.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(lines.len(), 3, "should have 3 lines: {:?}", lines);
+
+        // First line: top level
+        assert!(lines[0].starts_with("• "), "line 1: {:?}", lines[0]);
+        assert!(
+            !lines[0].starts_with("• •"),
+            "line 1 double bullet: {:?}",
+            lines[0]
+        );
+
+        // Second line: second level
+        assert!(lines[1].starts_with("  • "), "line 2: {:?}", lines[1]);
+        assert!(
+            !lines[1].starts_with("• •"),
+            "line 2 double bullet: {:?}",
+            lines[1]
+        );
+
+        // Third line: third level
+        assert!(lines[2].starts_with("    • "), "line 3: {:?}", lines[2]);
+        assert!(
+            !lines[2].starts_with("• •"),
+            "line 3 double bullet: {:?}",
+            lines[2]
+        );
+    }
+
+    #[test]
+    fn user_issue_nested_list_with_text() {
+        // Test case similar to the user's reported issue:
+        // parent item with text, followed by nested list items
+        let input = "- Top of loop: cur_h = 40\n  - input_row = output.cursor_row()\n    After Frame 1, the cursor was positioned at visual_row\n  - visual_row = (row + layout.cursor_row).saturating_sub(delta)\n";
+        let out = render_with(&parse(input), &Theme::no_color(), 80);
+        println!("User issue test:\n{}", out);
+
+        // Check for double bullets - the main bug being fixed
+        for line in out.lines() {
+            assert!(
+                !line.contains("• •"),
+                "found double bullet in line: {:?}",
+                line
+            );
+        }
+
+        let lines: Vec<&str> = out.lines().filter(|l| !l.is_empty()).collect();
+
+        // First line: parent item with text
+        assert!(lines[0].starts_with("• "), "line 1: {:?}", lines[0]);
+        assert!(
+            lines[0].contains("Top of loop"),
+            "line 1 should contain text: {:?}",
+            lines[0]
+        );
+
+        // Second line: nested item 1 (starts with bullet)
+        let nested1_idx = lines
+            .iter()
+            .position(|l| l.starts_with("  • "))
+            .expect("nested item 1 not found");
+        assert!(
+            lines[nested1_idx].contains("input_row"),
+            "nested 1: {:?}",
+            lines[nested1_idx]
+        );
+
+        // Fourth line: nested item 2
+        let nested2_idx = lines
+            .iter()
+            .position(|l| l.starts_with("  • visual_row"))
+            .expect("nested item 2 not found");
+        assert!(
+            lines[nested2_idx].contains("visual_row"),
+            "nested 2: {:?}",
+            lines[nested2_idx]
+        );
+
+        // Ensure nested2 comes after nested1
+        assert!(
+            nested2_idx > nested1_idx,
+            "nested2 should come after nested1"
+        );
+    }
+
+    #[test]
+    fn loose_list_with_nested_list() {
+        // Loose list (blank lines between items) with a nested list
+        let input = "- item 1\n\n- item 2\n  - nested 1\n  - nested 2\n\n- item 3\n";
+        let out = render_with(&parse(input), &Theme::no_color(), 80);
+        println!("Loose list with nested:\n{}", out);
+
+        // Check for double bullets
+        for line in out.lines() {
+            assert!(
+                !line.contains("• •"),
+                "found double bullet in line: {:?}",
+                line
+            );
+        }
+
+        // item 1 (loose -> wrapped in <p> -> rendered as paragraph with blank line after)
+        // item 2 with nested list
+        // item 3 (loose)
+        let lines: Vec<&str> = out.lines().filter(|l| !l.is_empty()).collect();
+        // Should have: item1, item2 text, nested1, nested2, item3
+        assert!(
+            lines.len() >= 5,
+            "should have at least 5 non-empty lines: {:?}",
+            lines
+        );
+
+        // Check structure
+        assert!(lines[0].starts_with("• "), "line 1: {:?}", lines[0]);
+        assert!(lines[0].contains("item 1"), "line 1: {:?}", lines[0]);
+
+        // item 2 starts after a blank line
+        let item2_idx = lines
+            .iter()
+            .position(|l| l.contains("item 2"))
+            .expect("item 2 not found");
+        assert!(
+            lines[item2_idx].starts_with("• "),
+            "item 2 line: {:?}",
+            lines[item2_idx]
+        );
+
+        // nested items after item 2
+        assert!(
+            lines[item2_idx + 1].starts_with("  • "),
+            "nested 1: {:?}",
+            lines[item2_idx + 1]
+        );
+        assert!(
+            lines[item2_idx + 2].starts_with("  • "),
+            "nested 2: {:?}",
+            lines[item2_idx + 2]
         );
     }
 }

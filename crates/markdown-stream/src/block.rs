@@ -1063,7 +1063,14 @@ impl StreamParser {
             match slot {
                 Slot::Event(ev) => out.push(ev),
                 Slot::Deferred(d) => {
-                    inline::parse(&d.text, &d.style, &self.refs, self.gfm, self.disable_strikethrough, out);
+                    inline::parse(
+                        &d.text,
+                        &d.style,
+                        &self.refs,
+                        self.gfm,
+                        self.disable_strikethrough,
+                        out,
+                    );
                 }
             }
         }
@@ -1342,7 +1349,14 @@ impl StreamParser {
                         &mut labels,
                     );
                 } else {
-                    inline::parse(body, &style, &self.refs, self.gfm, self.disable_strikethrough, &mut inner);
+                    inline::parse(
+                        body,
+                        &style,
+                        &self.refs,
+                        self.gfm,
+                        self.disable_strikethrough,
+                        &mut inner,
+                    );
                 }
                 let deferred = if self.disable_forward_refs {
                     None

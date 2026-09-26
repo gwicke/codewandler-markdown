@@ -28,7 +28,14 @@ type Refs = HashMap<String, LinkDef>;
 /// given base `style`, resolving reference links against `refs`, appending events to `out`. `gfm`
 /// enables the GFM extended (bare) autolink syntax. `disable_strikethrough` treats `~` as a literal
 /// character (never a strikethrough delimiter).
-pub fn parse(text: &str, style: &InlineStyle, refs: &Refs, gfm: bool, disable_strikethrough: bool, out: &mut Vec<Event>) {
+pub fn parse(
+    text: &str,
+    style: &InlineStyle,
+    refs: &Refs,
+    gfm: bool,
+    disable_strikethrough: bool,
+    out: &mut Vec<Event>,
+) {
     let mut tokens = scan(text, refs, gfm, disable_strikethrough, &mut None);
     process_emphasis(&mut tokens, 0);
     flatten(&tokens, style, out);
@@ -121,7 +128,13 @@ struct Delim {
 /// (bare) autolink syntax. `disable_strikethrough` treats `~` as a literal character. When
 /// `unresolved` is `Some`, the normalised labels of reference links/images whose label is
 /// undefined are recorded into it (for forward-reference detection).
-fn scan(text: &str, refs: &Refs, gfm: bool, disable_strikethrough: bool, unresolved: &mut Option<Vec<String>>) -> Vec<Token> {
+fn scan(
+    text: &str,
+    refs: &Refs,
+    gfm: bool,
+    disable_strikethrough: bool,
+    unresolved: &mut Option<Vec<String>>,
+) -> Vec<Token> {
     let b = text.as_bytes();
     let mut tokens: Vec<Token> = Vec::new();
     let mut buf = String::new();
