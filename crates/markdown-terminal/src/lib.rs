@@ -33,6 +33,79 @@ pub fn render_with(events: &[Event], theme: &Theme, width: usize) -> String {
     String::from_utf8(out).expect("renderer emits utf-8")
 }
 
+/// Wraps a sink so every rendered row carries the faint attribute itself: `\x1b[2m` before the
+/// row's content, `\x1b[0m` after it. This is what [`Theme::faint_rows`] buys a caller: faded
+/// content without an escape the caller has to remember to open and close.
+///
+/// Nothing is buffered, and the wrapping does not depend on where a write lands: a row is
+/// prefixed once however many writes carry its bytes — a table row arrives as border, cells and
+/// resets across separate writes, and is still one row — and the prefix is only due while no row
+/// is open. [`feed`](Renderer::feed) closes whatever is still open when the feed ends, so no
+/// attribute outlives the batch. An empty row — the gap between two paragraphs — passes through
+/// bare: there is nothing on it to fade, and the attribute would only add bytes.
+struct FaintRows<W: Write> {
+    inner: W,
+    /// True while a row has content but no newline yet.
+    open: bool,
+}
+
+impl<W: Write> FaintRows<W> {
+    const ON: &'static [u8] = b"\x1b[2m";
+    const OFF: &'static [u8] = b"\x1b[0m";
+
+    /// Close a row the feed left dangling, so the attribute cannot outlive the batch.
+    fn close_row(&mut self) -> io::Result<()> {
+        if self.open {
+            self.inner.write_all(Self::OFF)?;
+            self.open = false;
+        }
+        Ok(())
+    }
+}
+
+impl<W: Write> Write for FaintRows<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let mut rest = buf;
+        while !rest.is_empty() {
+            match rest.iter().position(|b| *b == b'\n') {
+                Some(i) => {
+                    let (row, tail) = rest.split_at(i);
+                    if !row.is_empty() {
+                        if !self.open {
+                            self.inner.write_all(Self::ON)?;
+                            self.open = true;
+                        }
+                        self.inner.write_all(row)?;
+                    }
+                    // The close keys on the *row*, not this fragment: a write may carry only the
+                    // newline, or only more of a row an earlier write opened.
+                    if self.open {
+                        self.inner.write_all(Self::OFF)?;
+                        self.open = false;
+                    }
+                    self.inner.write_all(b"\n")?;
+                    rest = &tail[1..];
+                }
+                None => {
+                    if !rest.is_empty() {
+                        if !self.open {
+                            self.inner.write_all(Self::ON)?;
+                            self.open = true;
+                        }
+                        self.inner.write_all(rest)?;
+                    }
+                    rest = &[];
+                }
+            }
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
 /// A stateful renderer that can be fed events incrementally and writes completed output to a sink.
 ///
 /// This is the live renderer: hold one across many `Parser::write` calls and it emits each block as
@@ -140,10 +213,25 @@ impl Renderer {
     }
 
     /// Feed a batch of events, writing any newly-completed output to `w`.
+    ///
+    /// With [`Theme::faint_rows`] set, the output is bracketed row by row: the row is written
+    /// inside the faint attribute rather than inside one the caller opened, so nothing about the
+    /// caller's state decides whether the content is faded.
     pub fn feed<W: Write>(&mut self, events: &[Event], w: &mut W) -> io::Result<()> {
-        for ev in events {
-            self.event(ev, w)?;
+        if !self.theme.faint_rows {
+            for ev in events {
+                self.event(ev, w)?;
+            }
+            return Ok(());
         }
+        let mut rows = FaintRows {
+            inner: w,
+            open: false,
+        };
+        for ev in events {
+            self.event(ev, &mut rows)?;
+        }
+        rows.close_row()?;
         Ok(())
     }
 
@@ -884,8 +972,9 @@ fn wrap_runs(
 
 #[cfg(test)]
 mod tests {
-    use super::{render_with, Theme};
+    use super::{render_with, FaintRows, Theme};
     use markdown_stream::parse;
+    use std::io::Write as _;
 
     fn render(src: &str, width: usize) -> String {
         render_with(&parse(src), &Theme::no_color(), width)
@@ -990,6 +1079,64 @@ mod tests {
         assert!(
             out.contains("\x1b[2m"),
             "output must contain the faint attribute"
+        );
+    }
+
+    #[test]
+    fn dimmed_theme_makes_every_row_self_contained() {
+        // Each row fades on its own terms: the attribute opens before its content and closes
+        // after it. That is what frees the caller from tracking an open escape across the
+        // document — and what stops the faint from bleeding into whatever it writes next.
+        let out = render_with(
+            &parse("First para.\n\nSecond para.\n"),
+            &Theme::dimmed(),
+            80,
+        );
+        for line in out.split('\n') {
+            assert!(
+                line.is_empty() || (line.starts_with("\x1b[2m") && line.ends_with("\x1b[0m")),
+                "every non-empty row must be bracketed in the faint attribute: {line:?}"
+            );
+        }
+        assert!(
+            !out.ends_with("\x1b[2m"),
+            "the stream must not end with the attribute open: {out:?}"
+        );
+    }
+
+    #[test]
+    fn faint_rows_are_independent_of_write_boundaries() {
+        // Where a streaming chunk happens to fall must not be visible: a row split across two
+        // writes still renders as one bracketed row, and a row with no trailing newline is
+        // closed rather than left open for the next writer to inherit.
+        let mut out = Vec::new();
+        let mut rows = FaintRows {
+            inner: &mut out,
+            open: false,
+        };
+        rows.write_all(b"alpha\nbra").unwrap();
+        rows.write_all(b"vo\n\ncharlie").unwrap();
+        // `charlie` has no newline: it is prefixed once across the two writes and closed exactly
+        // once, at the feed's end — not once per fragment, and not left open.
+        rows.close_row().unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "\x1b[2malpha\x1b[0m\n\x1b[2mbravo\x1b[0m\n\n\x1b[2mcharlie\x1b[0m"
+        );
+    }
+
+    #[test]
+    fn non_faint_themes_are_untouched() {
+        // The wrapping is a property of the theme, not of the renderer: plain output must stay
+        // byte-for-byte what it was, or a piped query grows escape noise.
+        let out = render_with(&parse("Plain text.\n"), &Theme::default(), 80);
+        assert!(
+            !out.contains("\x1b[2m"),
+            "default theme must not faint rows: {out:?}"
+        );
+        assert_eq!(
+            render_with(&parse("Plain text.\n"), &Theme::no_color(), 80),
+            "Plain text.\n"
         );
     }
 

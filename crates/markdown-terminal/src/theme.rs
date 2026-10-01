@@ -24,6 +24,15 @@ pub struct Theme {
     /// WezTerm, Kitty, …). Off by default — callers opt in (e.g. only on a real
     /// TTY) so logs and pipes stay free of escape noise.
     pub clickable_links: bool,
+    /// When `true`, the renderer brackets **every rendered row** in the faint attribute
+    /// (`\x1b[2m` before the row's content, `\x1b[0m` after it), so a faded document is made of
+    /// self-contained rows.
+    ///
+    /// This is what lets a caller treat faded output as ordinary content: no escape is left open
+    /// across rows, so a block cannot bleed its dimming into the text after it, and the stream
+    /// ends in a clean terminal state rather than a pending SGR nobody will close. Set by
+    /// [`Theme::dimmed`]; every other theme leaves rows untouched.
+    pub faint_rows: bool,
 }
 
 impl Default for Theme {
@@ -43,16 +52,22 @@ impl Default for Theme {
             comment: "\x1b[90m", // bright black
             num: "\x1b[33m",     // yellow
             clickable_links: false,
+            faint_rows: false,
         }
     }
 }
 
 impl Theme {
     /// A theme for secondary/faded content (e.g. streamed "thinking" /
-    /// reasoning): styled spans are faded, and — crucially — `reset` re-applies
-    /// the faint attribute (`\x1b[2m`) instead of a bare `\x1b[0m`, so inline
-    /// formatting does not wipe the dimming. Callers still emit an initial
-    /// `\x1b[2m` for plain (unstyled) text.
+    /// reasoning): styled spans are faded, `reset` re-applies the faint
+    /// attribute (`\x1b[2m`) instead of a bare `\x1b[0m` so inline formatting
+    /// does not wipe the dimming *within* a row, and `faint_rows` makes the
+    /// renderer bracket each row in `\x1b[2m` … `\x1b[0m` around that.
+    ///
+    /// The two halves are what let a caller stop managing the attribute: a row
+    /// re-opens the faint whatever preceded it, so plain unstyled text is dim
+    /// without the caller emitting an initial `\x1b[2m`, and the row that ends
+    /// the stream closes it. Callers just write the bytes.
     pub fn dimmed() -> Self {
         Theme {
             heading: "\x1b[1;36m",
@@ -68,6 +83,7 @@ impl Theme {
             comment: "\x1b[90m",
             num: "\x1b[33m",
             clickable_links: false,
+            faint_rows: true,
         }
     }
 
@@ -87,6 +103,7 @@ impl Theme {
             comment: "",
             num: "",
             clickable_links: false,
+            faint_rows: false,
         }
     }
 
