@@ -466,7 +466,24 @@ impl Renderer {
             } else {
                 highlight::highlight_line(body, &self.code_lang, &self.theme)
             };
-            write!(w, "{}  {}", self.indent(), rendered)?;
+            // Over-wide code used to natural-wrap in the terminal, entering
+            // the continuation row with no byte between rows — which a
+            // caller's line-clear never clears, leaking whatever the frame
+            // below painted (the status bar) into the content. Wrap at the
+            // source instead: colors/bg ride the terminal's SGR state across
+            // the break, and continuation rows sit +2 deeper than the code
+            // offset (2 → 4) so a wrapped block still reads as one level.
+            let indent = self.indent();
+            let base = visible_width(&indent);
+            let first = self.width.saturating_sub(base + 2).max(4);
+            let cont = self.width.saturating_sub(base + 4).max(4);
+            for (li, seg) in wrap_ansi(&rendered, first, cont).iter().enumerate() {
+                if li == 0 {
+                    write!(w, "{indent}  {seg}")?;
+                } else {
+                    write!(w, "\n{indent}    {seg}")?;
+                }
+            }
             if nl {
                 writeln!(w)?;
             }
@@ -683,7 +700,11 @@ impl Renderer {
         let first = self.indent_first();
 
         write!(w, "{first}")?;
-        for (li, line) in wrap_runs(&segments, avail, false).iter().enumerate() {
+        // `hard = true`: an over-long token (URL, path) force-splits at the
+        // cell edge instead of overflowing the row — an overflowing prose row
+        // natural-wraps in the terminal, and the continuation enters with no
+        // byte, which the caller's line-clear never clears.
+        for (li, line) in wrap_runs(&segments, avail, true).iter().enumerate() {
             if li > 0 {
                 write!(w, "{cont}")?;
             }
@@ -970,6 +991,174 @@ fn wrap_runs(
     lines
 }
 
+/// Punctuation a wrapped code line may break **before** (approved set): the
+/// punctuation lands at the head of the continuation, so a `.` never ends a
+/// line — `foo.` reading as a sentence end is exactly what this avoids.
+const CODE_BREAK_PUNCT: &str = ".,;:/\\-_>)]}";
+
+/// Byte just past the escape sequence starting at `i` (which must be an ESC):
+/// CSI (`ESC [ … final`), OSC (`ESC ] … BEL | ST`), DCS/SOS/PM/APC
+/// (`ESC P/X/^/_ … ST`), otherwise a two-byte escape. Escapes are ASCII, so
+/// every offset here is also a `&str` boundary.
+fn escape_end(b: &[u8], i: usize) -> usize {
+    match b.get(i + 1) {
+        Some(b'[') => {
+            let mut j = i + 2;
+            while j < b.len() && !(0x40..=0x7e).contains(&b[j]) {
+                j += 1;
+            }
+            (j + 1).min(b.len())
+        }
+        Some(b']') => {
+            let mut j = i + 2;
+            while j < b.len() {
+                if b[j] == 0x07 {
+                    return j + 1;
+                }
+                if b[j] == 0x1b && b.get(j + 1) == Some(&b'\\') {
+                    return j + 2;
+                }
+                j += 1;
+            }
+            b.len()
+        }
+        Some(b'P' | b'X' | b'^' | b'_') => {
+            let mut j = i + 2;
+            while j < b.len() {
+                if b[j] == 0x1b && b.get(j + 1) == Some(&b'\\') {
+                    return j + 2;
+                }
+                j += 1;
+            }
+            b.len()
+        }
+        _ => (i + 2).min(b.len()),
+    }
+}
+
+/// Wrap one *already highlighted* code line to `first` columns on its first
+/// row and `cont` on every continuation — the ANSI-aware counterpart of
+/// [`wrap_runs`] for text whose styling is embedded in the bytes rather than
+/// tracked as runs (`write_code_line`).
+///
+/// - **Escapes never split** and count no width; escapes held when a break
+///   happens travel with the text they style.
+/// - **Break preference**: whitespace (the held spaces are dropped), else
+///   *before* punctuation in [`CODE_BREAK_PUNCT`] (only the first char of a
+///   run — `::` and `->` break as units), else a forced split at the cell
+///   edge. The punctuation lands after the break, at the head of the
+///   continuation row.
+/// - **Colors survive by construction**: SGR state belongs to the terminal,
+///   an inserted newline does not touch it, and a highlighted token carries
+///   its own `reset` on whichever row its bytes fall. Backgrounds behave the
+///   same way.
+/// - A line that fits comes back **byte-identical** — short code lines are
+///   unchanged, escapes and trailing spaces included.
+///
+/// `line` must not contain newlines (one physical line per call).
+fn wrap_ansi(line: &str, first: usize, cont: usize) -> Vec<String> {
+    let first = first.max(4);
+    let cont = cont.max(4);
+    let mut segs: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut cur_w = 0usize;
+    // Whitespace break inside `cur`: byte index of a space run already
+    // flushed in (the run is skipped in the carry). Latest wins.
+    let mut space_opp: Option<usize> = None;
+    // Break *before* this byte — where a qualifying punct was placed.
+    let mut punct_opp: Option<usize> = None;
+    // Held-back bytes since the last committed visible char, in stream order:
+    // spaces and escapes. A whitespace break drops the spaces and keeps the
+    // escapes (they style what comes next).
+    let mut pending = String::new();
+    let mut pending_w = 0usize;
+    let mut prev_vis: Option<char> = None;
+
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == 0x1b {
+            let j = escape_end(bytes, i);
+            pending.push_str(&line[i..j]);
+            i = j;
+            continue;
+        }
+        let ch = line[i..].chars().next().unwrap_or('\0');
+        i += ch.len_utf8();
+        if ch == ' ' || ch == '\t' {
+            pending.push(ch);
+            pending_w += 1;
+            continue;
+        }
+        let cw = UnicodeWidthStr::width(ch.to_string().as_str());
+        let b = if segs.is_empty() { first } else { cont };
+        if cur_w > 0 && cur_w + pending_w + cw > b {
+            if pending_w > 0 {
+                // Whitespace break: the held spaces are the break itself.
+                segs.push(std::mem::take(&mut cur));
+                let mut esc = std::mem::take(&mut pending);
+                esc.retain(|c| c != ' ' && c != '\t');
+                cur = esc;
+            } else {
+                let split = match (space_opp, punct_opp) {
+                    (Some(s), Some(p)) => Some(s.max(p)),
+                    (Some(s), None) => Some(s),
+                    (None, Some(p)) => Some(p),
+                    (None, None) => None,
+                };
+                match split {
+                    Some(idx) => {
+                        let tail: String = cur[idx..]
+                            .chars()
+                            .skip_while(|&c| c == ' ' || c == '\t')
+                            .collect();
+                        segs.push(cur[..idx].to_string());
+                        cur = tail;
+                        cur.push_str(&pending);
+                        pending.clear();
+                    }
+                    None => {
+                        // Forced split at the cell edge: no break point since
+                        // the line started, so `cur` (which always fits)
+                        // closes the row and the current char opens the next.
+                        segs.push(std::mem::take(&mut cur));
+                        cur = std::mem::take(&mut pending);
+                    }
+                }
+            }
+            pending_w = 0;
+            space_opp = None;
+            punct_opp = None;
+            cur.push(ch);
+            cur_w = visible_width(&cur);
+            prev_vis = Some(ch);
+            continue;
+        }
+        // Fits: commit the held bytes, recording a whitespace break point if
+        // the hold contained spaces.
+        if pending_w > 0 {
+            if let Some(off) = pending.find([' ', '\t']) {
+                space_opp = Some(cur.len() + off);
+            }
+        }
+        cur_w += pending_w;
+        cur.push_str(&pending);
+        pending.clear();
+        pending_w = 0;
+        if CODE_BREAK_PUNCT.contains(ch) && prev_vis.is_some_and(|p| !CODE_BREAK_PUNCT.contains(p))
+        {
+            punct_opp = Some(cur.len());
+        }
+        cur.push(ch);
+        cur_w += cw;
+        prev_vis = Some(ch);
+    }
+    // Trailing hold (line-end spaces, a final escape) belongs to the line.
+    cur.push_str(&pending);
+    segs.push(cur);
+    segs
+}
+
 #[cfg(test)]
 mod tests {
     use super::{render_with, FaintRows, Theme};
@@ -978,6 +1167,150 @@ mod tests {
 
     fn render(src: &str, width: usize) -> String {
         render_with(&parse(src), &Theme::no_color(), width)
+    }
+
+    /// Strip everything `wrap_ansi` may carry: assertions here are on cells
+    /// and break points, not on styling bytes.
+    fn strip_ansi(s: &str) -> String {
+        use super::escape_end;
+        let b = s.as_bytes();
+        let mut out = String::new();
+        let mut i = 0;
+        while i < b.len() {
+            if b[i] == 0x1b {
+                i = escape_end(b, i);
+                continue;
+            }
+            let ch = s[i..].chars().next().unwrap_or('\0');
+            out.push(ch);
+            i += ch.len_utf8();
+        }
+        out
+    }
+
+    #[test]
+    fn overwide_code_line_wraps_with_deeper_continuations() {
+        use super::visible_width;
+        let src = format!("```rust\nlet x = {};\n```\n", "a".repeat(50));
+        let out = render(&src, 30);
+        let rows: Vec<&str> = out.lines().filter(|l| !l.is_empty()).collect();
+        assert!(rows.len() >= 3, "long code should wrap: {out:?}");
+        for r in &rows {
+            assert!(
+                visible_width(r) <= 30,
+                "row wider than the terminal: {r:?} ({})",
+                visible_width(r)
+            );
+        }
+        assert!(
+            rows[0].starts_with("  ") && !rows[0].starts_with("    "),
+            "code offset on the first row: {:?}",
+            rows[0]
+        );
+        for r in &rows[1..] {
+            assert!(
+                r.starts_with("    "),
+                "continuation +2 deeper than the code offset: {r:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn wrapped_code_keeps_its_highlight_across_the_break() {
+        // A string token long enough that the wrap lands inside it: the
+        // green span (`\x1b[32m` … `\x1b[0m`) must contain the newline —
+        // color opened before the break, closed after, never in between.
+        let src = format!("```rust\nlet a = \"{}\";\n```\n", "s".repeat(50));
+        let out = render_with(&parse(&src), &Theme::default(), 30);
+        let open = out.find("\x1b[32m").expect("string token is colored");
+        let reset_rel = out[open..]
+            .find("\x1b[0m")
+            .expect("the token closes with a reset");
+        let span = &out[open..open + reset_rel];
+        assert!(
+            span.contains('\n'),
+            "the wrap should land inside the colored token, splitting it \
+             across rows with the color active: {span:?}"
+        );
+    }
+
+    #[test]
+    fn code_breaks_before_punctuation_so_a_dot_leads_the_continuation() {
+        use super::visible_width;
+        // No spaces anywhere: punctuation is the only break point available.
+        let src = format!("```\naaaa.{};\n```\n", "b".repeat(40));
+        let out = render(&src, 20);
+        let rows: Vec<String> = out
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(strip_ansi)
+            .collect();
+        assert!(rows.len() >= 2, "should wrap: {out:?}");
+        assert_eq!(rows[0], "  aaaa", "line fills to its break point: {rows:?}");
+        assert!(
+            rows[1].starts_with("    ."),
+            "`.` lands after the break, leading the continuation: {rows:?}"
+        );
+        for r in &rows {
+            assert!(visible_width(r) <= 20, "row too wide: {r:?}");
+        }
+
+        // A punct run breaks as a unit: `::` never splits.
+        let src = format!("```\nxx::{}\n```\n", "c".repeat(40));
+        let out = render(&src, 20);
+        let rows: Vec<String> = out
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(strip_ansi)
+            .collect();
+        assert_eq!(
+            rows[0], "  xx",
+            "break before the run's first colon: {rows:?}"
+        );
+        assert!(rows[1].starts_with("    ::"), "run intact: {rows:?}");
+    }
+
+    #[test]
+    fn code_force_splits_when_no_break_point_exists() {
+        use super::visible_width;
+        let src = format!("```\nxyz{}\n```\n", "c".repeat(40));
+        let out = render(&src, 20);
+        let rows: Vec<String> = out
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(strip_ansi)
+            .collect();
+        // first budget = 20 - 2 = 18 cells of code on row one.
+        assert_eq!(rows[0], format!("  xyz{}", "c".repeat(15)), "{rows:?}");
+        for r in &rows {
+            assert!(visible_width(r) <= 20, "row too wide: {r:?}");
+        }
+        assert!(rows.len() >= 3, "the rest continues below: {rows:?}");
+    }
+
+    #[test]
+    fn short_code_line_is_unchanged() {
+        // No wrap → byte-identical output: the code offset, the highlight,
+        // the newline — nothing added.
+        let out = render_with(&parse("```rust\nlet a = 1;\n```\n"), &Theme::default(), 80);
+        let expected = format!(
+            "  {}\n",
+            super::highlight::highlight_line("let a = 1;", "rust", &Theme::default())
+        );
+        assert!(out.contains(&expected), "unchanged: {out:?}");
+    }
+
+    #[test]
+    fn overlong_prose_token_force_wraps() {
+        use super::visible_width;
+        let url = format!("https://example.com/{}", "x".repeat(60));
+        let out = render(&format!("see {url} end\n"), 30);
+        for l in out.lines() {
+            assert!(
+                visible_width(l) <= 30,
+                "an over-long prose token must not overflow its row: {l:?}"
+            );
+        }
     }
 
     #[test]
